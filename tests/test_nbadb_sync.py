@@ -17,8 +17,8 @@ def test_season_for_date_before_july():
     assert nbadb_sync._season_for_date(date(2025, 3, 10)) == "2024-25"
 
 
-def test_default_start_date_october():
-    assert nbadb_sync._default_start_date(date(2025, 3, 5)) == date(2024, 10, 1)
+def test_default_start_date_historical():
+    assert nbadb_sync._default_start_date(date(2025, 3, 5)) == date(1946, 11, 1)
 
 
 def test_update_raw_data_creates_files(tmp_path, monkeypatch):

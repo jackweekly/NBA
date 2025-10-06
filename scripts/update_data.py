@@ -20,7 +20,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--start-date",
-        help="Optional ISO date (YYYY-MM-DD) marking the first day to download.",
+        help=(
+            "Optional ISO date (YYYY-MM-DD) marking the first day to download. "
+            "Defaults to 1946-11-01 when omitted."
+        ),
     )
     parser.add_argument(
         "--end-date",

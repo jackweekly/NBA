@@ -24,6 +24,7 @@ NBADB_DATASET_METADATA_URL = (
 KAGGLE_DATASET_ID = "wyattowalsh/basketball"
 MANIFEST_FILENAME = "manifest.json"
 DATE_FORMAT = "%Y-%m-%d"
+HISTORICAL_START_DATE = date(1946, 11, 1)
 SEASON_TYPES: tuple[str, ...] = (
     "Regular Season",
     "Playoffs",
@@ -78,9 +79,16 @@ def _write_manifest(output_dir: Path, payload: Dict[str, object]) -> None:
 
 
 def _default_start_date(today: Optional[date] = None) -> date:
-    today = today or date.today()
-    season_start_year = today.year if today.month >= 7 else today.year - 1
-    return date(season_start_year, 10, 1)
+    """Return the default start date for data ingestion.
+
+    Unless the caller or manifest specifies an alternative, updates should begin
+    from the first day of the inaugural BAA season (1 November 1946). The
+    ``today`` argument is accepted for backwards compatibility with callers that
+    may have relied on the previous behaviour in tests.
+    """
+
+    _ = today  # ``today`` is unused now but kept for compatibility.
+    return HISTORICAL_START_DATE
 
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
@@ -196,6 +204,7 @@ def update_raw_data(
     Args:
         output_dir: Directory where raw CSV files should be written.
         start_date: Optional ISO date string overriding the computed start date.
+            Defaults to ``1946-11-01`` when the manifest has no history.
         end_date: Optional ISO date string to stop updates (inclusive). Defaults to
             ``yesterday``.
         bootstrap_kaggle: Whether to fetch the Kaggle dataset before processing.

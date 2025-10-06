@@ -32,8 +32,10 @@ python scripts/update_data.py --start-date 2024-10-01
 ```
 
 This command will fetch league game logs from 1 October 2024 until yesterday
-and store them under `data/raw`. To run from Python, call
-`nbapredictor.update_raw_data()`.
+and store them under `data/raw`. When neither `--start-date` nor a manifest
+value is provided the updater will backfill every day from 1 November 1946 so
+your local archive always reflects the full NBA/BAA history. To run from
+Python, call `nbapredictor.update_raw_data()`.
 
 If the [Kaggle dataset](https://www.kaggle.com/datasets/wyattowalsh/basketball)
 should be downloaded before the incremental update, pass
