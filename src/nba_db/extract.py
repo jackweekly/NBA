@@ -70,21 +70,25 @@ def _format_for_api(value: Optional[date]) -> Optional[str]:
 
 
 def get_league_game_log_from_date(
-    datefrom: date,
-    dateto: Optional[date] = None,
+    datefrom: str,
+    dateto: Optional[str] = None,
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> pd.DataFrame:
     """Fetch league game logs between ``datefrom`` and ``dateto`` (inclusive)."""
 
+    # Convert string dates to date objects
+    datefrom_obj = date.fromisoformat(datefrom)
+    dateto_obj = date.fromisoformat(dateto) if dateto else None
+
     today = date.today()
     latest_season_year = _latest_started_season_year(today)
-    effective_end = dateto or today
+    effective_end = dateto_obj or today
     effective_end_year = min(_season_year_for_date(effective_end), latest_season_year)
-    start_year = _season_year_for_date(datefrom)
+    start_year = _season_year_for_date(datefrom_obj)
 
     if start_year > latest_season_year:
-        LOGGER.info("Start date %s is in a future season; returning empty frame", datefrom)
+        LOGGER.info("Start date %s is in a future season; returning empty frame", datefrom_obj)
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
@@ -94,7 +98,7 @@ def get_league_game_log_from_date(
         season = _season_label(season_year)
         season_start = date(season_year, 7, 1)
         season_end = date(season_year + 1, 6, 30)
-        season_from = datefrom if season_year == start_year else season_start
+        season_from = datefrom_obj if season_year == start_year else season_start
         season_to = effective_end if season_year == effective_end_year else season_end
 
         for season_type in SEASON_TYPES:
@@ -137,9 +141,9 @@ def get_league_game_log_from_date(
 
     combined = pd.concat(frames, ignore_index=True)
     if "game_date" in combined.columns:
-        upper_bound = dateto or effective_end
+        upper_bound = dateto_obj or effective_end
         mask = combined["game_date"].isna() | (
-            (combined["game_date"].dt.date >= datefrom) &
+            (combined["game_date"].dt.date >= datefrom_obj) &
             (combined["game_date"].dt.date <= upper_bound)
         )
         combined = combined[mask]
