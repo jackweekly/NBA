@@ -41,7 +41,9 @@ NBA_API_HEADERS = {
     "Referer": "https://stats.nba.com/",
 }
 
-DEFAULT_TIMEOUT = 10
+DEFAULT_TIMEOUT = 30
+MAX_REQUEST_RETRIES = 5
+MAX_BACKOFF_SECONDS = 16
 
 
 @dataclass
@@ -252,12 +254,16 @@ def _write_dataframe(path: Path, frame: pd.DataFrame, *, append: bool) -> int:
 
 def _call_with_retry(description: str, func: Callable[[], pd.DataFrame]) -> pd.DataFrame:
     last_error: Optional[Exception] = None
-    for attempt in range(3):
+    delay = 1
+    for attempt in range(1, MAX_REQUEST_RETRIES + 1):
         try:
             return func()
         except requests_exceptions.RequestException as exc:  # pragma: no cover - network
             last_error = exc
-            time.sleep(2 ** attempt)
+            if attempt == MAX_REQUEST_RETRIES:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, MAX_BACKOFF_SECONDS)
     if last_error is not None:  # pragma: no cover - network
         raise RuntimeError(f"Failed to fetch {description}") from last_error
     raise RuntimeError(f"Failed to fetch {description}")
