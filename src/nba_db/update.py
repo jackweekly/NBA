@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import duckdb
 
 from . import extract
-from .paths import GAME_CSV, RAW_DIR
+from .paths import GAME_CSV, RAW_DIR, DUCKDB_PATH
 
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +108,40 @@ def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
+
+
+
+def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
+    if frame.empty:
+        return
+
+    DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(DUCKDB_PATH))
+    con.execute('PRAGMA threads=4;')
+    try:
+        con.register('src', frame)
+        con.execute('CREATE TABLE IF NOT EXISTS bronze_game_log_team AS SELECT * FROM src WHERE 0=1')
+        if replace:
+            LOGGER.info('Replacing bronze_game_log_team with %s rows', len(frame))
+            con.execute('DELETE FROM bronze_game_log_team')
+            con.execute('INSERT INTO bronze_game_log_team SELECT * FROM src')
+        else:
+            LOGGER.info('Merging %s rows into bronze_game_log_team', len(frame))
+            con.execute("""MERGE INTO bronze_game_log_team AS tgt
+USING src AS src
+ON tgt.game_id = src.game_id
+ AND tgt.team_id = src.team_id
+ AND COALESCE(LOWER(tgt.season_type),'') = COALESCE(LOWER(src.season_type),'')
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *""")
+    finally:
+        try:
+            con.unregister('src')
+        except duckdb.Error:  # pragma: no cover - safe cleanup
+            pass
+        con.close()
+
+
 def _log_fetch_window(new_rows: pd.DataFrame) -> None:
     if "game_date" not in new_rows.columns:
         LOGGER.info("Fetched %s new rows (game_date column missing)", len(new_rows))
@@ -158,6 +193,7 @@ def daily(
         new_rows = _deduplicate(new_rows)
         _log_fetch_window(new_rows)
         _atomic_write_csv(new_rows, target_path)
+        _upsert_duckdb(new_rows, replace=True)
         final_count = len(new_rows)
         LOGGER.info("Wrote complete historical game log with %s rows to %s", final_count, target_path)
         return DailyUpdateResult(target_path, final_count, appended=False, final_row_count=final_count)
@@ -201,6 +237,7 @@ def daily(
     combined = _deduplicate(combined)
 
     _atomic_write_csv(combined, target_path)
+    _upsert_duckdb(new_rows)
     final_count = len(combined)
     appended_rows = max(final_count - len(existing), 0)
 

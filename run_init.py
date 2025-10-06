@@ -80,6 +80,20 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
 )
 
 
+def _seed_duckdb_from_bootstrap() -> None:
+    try:
+        from nba_db.duckdb_seed import seed_duckdb
+    except ModuleNotFoundError:
+        logging.warning('DuckDB seeding skipped because duckdb is not available')
+        return
+    try:
+        seed_duckdb()
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logging.warning('DuckDB seeding failed: %s', exc)
+    else:
+        logging.info('Seeded DuckDB warehouse at %s', DUCKDB_PATH)
+
+
 def _configure_numeric_environment() -> None:
     for key, value in _NUMERIC_ENV_DEFAULTS.items():
         os.environ.setdefault(key, value)

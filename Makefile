@@ -1,9 +1,9 @@
-.PHONY: load-db build-schema db
+.PHONY: seed-db build-schema db
 
-load-db:
-	python scripts/load_duckdb.py
+seed-db:
+	python scripts/seed_duckdb.py
 
 build-schema:
-	duckdb -c ".read sql/build_schema.sql"
+	python scripts/apply_schema.py
 
-db: load-db build-schema
+db: seed-db build-schema

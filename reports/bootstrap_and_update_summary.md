@@ -6,3 +6,5 @@
 - Rows appended during the first incremental update: 5,564.
 - Idempotency check: second incremental run appended 0 rows (row count remained 136,960).
 - Notable external call behaviour: stats.nba.com returned HTTP 400 for "In Season Tournament" seasons without data; these were skipped automatically after brief retries. No other retries or timeouts were observed.
+
+- DuckDB bronze_game_log_team rows: 136,960 (matches consolidated CSV).
