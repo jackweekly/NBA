@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from nba_db import update as nba_update
@@ -26,6 +28,7 @@ def test_daily_fetch_all_history(monkeypatch):
             "end_date": None,
             "bootstrap_kaggle": False,
             "force": False,
+            "fetch_all_history": True,
         }
     ]
     assert result.summary.downloaded_files == []
@@ -57,3 +60,18 @@ def test_run_daily_update_calls_daily(monkeypatch):
     run_daily_update.main(["--fetch-all-history"])
 
     assert calls == [{"fetch_all_history": True, "start_date": None}]
+
+
+def test_run_daily_update_sets_numeric_environment(monkeypatch):
+    def fake_daily(**kwargs):  # noqa: ARG001 - behaviour under test
+        return None
+
+    monkeypatch.setattr(nba_update, "daily", fake_daily)
+
+    for key in run_daily_update._NUMERIC_ENV_DEFAULTS:
+        monkeypatch.delenv(key, raising=False)
+
+    run_daily_update.main([])
+
+    for key, value in run_daily_update._NUMERIC_ENV_DEFAULTS.items():
+        assert os.environ[key] == value

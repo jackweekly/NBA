@@ -43,6 +43,7 @@ def daily(
         end_date=end_date,
         bootstrap_kaggle=bootstrap_kaggle,
         force=force,
+        fetch_all_history=fetch_all_history,
     )
     return DailyUpdateResult(summary=summary)
 

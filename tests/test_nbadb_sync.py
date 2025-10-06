@@ -51,9 +51,54 @@ def test_update_raw_data_creates_files(tmp_path, monkeypatch):
 
     assert len(summary.downloaded_files) == 2
     assert calls == [date(2024, 10, 1), date(2024, 10, 2)]
+    assert summary.processed_seasons == []
 
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["last_updated"] == "2024-10-02"
 
     for file_path in summary.downloaded_files:
         assert Path(file_path).exists()
+
+
+def test_update_raw_data_fetch_all_history(tmp_path, monkeypatch):
+    seasons_requested: list[str] = []
+
+    def fake_fetch_game_logs_for_season(season: str) -> pd.DataFrame:
+        seasons_requested.append(season)
+        return pd.DataFrame(
+            {
+                "SEASON_ID": ["2"],
+                "GAME_ID": ["0001"],
+            }
+        )
+
+    monkeypatch.setattr(
+        nbadb_sync,
+        "_fetch_game_logs_for_season",
+        fake_fetch_game_logs_for_season,
+    )
+    monkeypatch.setattr(
+        nbadb_sync,
+        "fetch_dataset_metadata",
+        lambda session=None: {"title": "NBA Database"},
+    )
+
+    summary = nbadb_sync.update_raw_data(
+        output_dir=tmp_path,
+        end_date="1948-06-30",
+        fetch_all_history=True,
+    )
+
+    assert seasons_requested == ["1946-47", "1947-48"]
+    assert summary.processed_seasons == ["1946-47", "1947-48"]
+    assert summary.downloaded_files == [
+        tmp_path / "leaguegamelog" / "season=1946-47" / "part-000.csv",
+        tmp_path / "leaguegamelog" / "season=1947-48" / "part-000.csv",
+    ]
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["historical_seasons"] == ["1946-47", "1947-48"]
+    assert manifest["last_updated"] == "1948-06-30"
+
+    for file_path in summary.downloaded_files:
+        assert file_path.exists()

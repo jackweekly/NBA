@@ -6,7 +6,7 @@ import logging
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -44,6 +44,9 @@ class UpdateSummary:
     downloaded_files: List[Path]
     skipped_dates: List[date]
     empty_dates: List[date]
+    processed_seasons: List[str] = field(default_factory=list)
+    skipped_seasons: List[str] = field(default_factory=list)
+    empty_seasons: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -51,6 +54,9 @@ class UpdateSummary:
             "downloaded_files": [str(p) for p in self.downloaded_files],
             "skipped_dates": [d.isoformat() for d in self.skipped_dates],
             "empty_dates": [d.isoformat() for d in self.empty_dates],
+            "processed_seasons": list(self.processed_seasons),
+            "skipped_seasons": list(self.skipped_seasons),
+            "empty_seasons": list(self.empty_seasons),
         }
 
 
@@ -103,6 +109,21 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
 def _season_for_date(target_date: date) -> str:
     season_start_year = target_date.year if target_date.month >= 7 else target_date.year - 1
     return f"{season_start_year}-{str(season_start_year + 1)[-2:]}"
+
+
+def _season_start_year(target_date: date) -> int:
+    return target_date.year if target_date.month >= 7 else target_date.year - 1
+
+
+def _season_end_date(season_start_year: int) -> date:
+    return date(season_start_year + 1, 6, 30)
+
+
+def _historical_season_range(start: date, end: date) -> Iterable[tuple[int, str]]:
+    start_year = _season_start_year(start)
+    end_year = _season_start_year(end)
+    for season_year in range(start_year, end_year + 1):
+        yield season_year, f"{season_year}-{str(season_year + 1)[-2:]}"
 
 
 def _fetch_game_logs_for_date(target_date: date, retries: int = 3, pause: float = 1.5) -> pd.DataFrame:
@@ -160,6 +181,59 @@ def _fetch_game_logs_for_date(target_date: date, retries: int = 3, pause: float 
     return pd.concat(frames, ignore_index=True)
 
 
+def _fetch_game_logs_for_season(season: str, retries: int = 3, pause: float = 1.5) -> pd.DataFrame:
+    if pd is None:  # pragma: no cover - dependency is optional in unit tests
+        raise ModuleNotFoundError("pandas is required to fetch game logs")
+
+    frames: List[pd.DataFrame] = []
+    for season_type in SEASON_TYPES:
+        attempt = 0
+        last_error: Optional[Exception] = None
+        while attempt < retries:
+            attempt += 1
+            try:
+                LOGGER.debug(
+                    "Fetching league game log for season %s (%s, attempt %s)",
+                    season,
+                    season_type,
+                    attempt,
+                )
+                endpoint = leaguegamelog.LeagueGameLog(
+                    league_id="00",
+                    season=season,
+                    season_type_all_star=season_type,
+                )
+                frame = endpoint.get_data_frames()[0]
+                if not frame.empty:
+                    frame.insert(0, "SEASON_TYPE", season_type)
+                    frames.append(frame)
+                break
+            except Exception as exc:  # noqa: BLE001 - third-party exceptions are opaque
+                last_error = exc
+                LOGGER.warning(
+                    "Attempt %s/%s failed for season %s (%s): %s",
+                    attempt,
+                    retries,
+                    season,
+                    season_type,
+                    exc,
+                )
+                time.sleep(pause * attempt)
+        else:
+            LOGGER.error(
+                "Unable to download data for season %s (%s) after %s attempts.",
+                season,
+                season_type,
+                retries,
+            )
+            if last_error:
+                raise RuntimeError("Failed to download season stats") from last_error
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def _date_range(start: date, end: date) -> Iterable[date]:
     current = start
     while current <= end:
@@ -203,6 +277,7 @@ def update_raw_data(
     bootstrap_kaggle: bool = False,
     force: bool = False,
     session: Optional[requests.Session] = None,
+    fetch_all_history: bool = False,
 ) -> UpdateSummary:
     """Update raw CSV dumps with daily statistics.
 
@@ -230,19 +305,70 @@ def update_raw_data(
     metadata = fetch_dataset_metadata(session=session)
     LOGGER.info("Fetched upstream metadata: %s", metadata.get("title", "unknown"))
 
-    start = _parse_date(start_date)
-    if start is None and manifest.get("last_updated"):
-        start = _parse_date(manifest["last_updated"]) + timedelta(days=1)
-    if start is None:
-        start = _default_start_date()
-
     stop = _parse_date(end_date)
     if stop is None:
         stop = date.today() - timedelta(days=1)
 
+    if fetch_all_history:
+        start = HISTORICAL_START_DATE
+    else:
+        start = _parse_date(start_date)
+        if start is None and manifest.get("last_updated"):
+            start = _parse_date(manifest["last_updated"]) + timedelta(days=1)
+        if start is None:
+            start = _default_start_date()
+
     if start > stop:
         LOGGER.info("No updates required: start=%s stop=%s", start, stop)
         return UpdateSummary([], [], [], [])
+
+    if fetch_all_history:
+        processed_seasons: List[str] = []
+        skipped_seasons: List[str] = []
+        empty_seasons: List[str] = []
+        downloaded: List[Path] = []
+
+        for season_year, season_label in _historical_season_range(start, stop):
+            season_dir = output_dir / "leaguegamelog" / f"season={season_label}"
+            destination = season_dir / "part-000.csv"
+            if destination.exists() and not force:
+                LOGGER.debug("Skipping season %s; file already exists", season_label)
+                skipped_seasons.append(season_label)
+                manifest["last_updated"] = min(
+                    stop, _season_end_date(season_year)
+                ).strftime(DATE_FORMAT)
+                _write_manifest(output_dir, manifest)
+                continue
+
+            LOGGER.info("Fetching stats for season %s", season_label)
+            frame = _fetch_game_logs_for_season(season_label)
+            if frame.empty:
+                LOGGER.info("No games found in season %s", season_label)
+                empty_seasons.append(season_label)
+            else:
+                season_dir.mkdir(parents=True, exist_ok=True)
+                frame.to_csv(destination, index=False)
+                downloaded.append(destination)
+                LOGGER.info("Saved %s rows to %s", len(frame), destination)
+
+            processed_seasons.append(season_label)
+            manifest["last_updated"] = min(
+                stop, _season_end_date(season_year)
+            ).strftime(DATE_FORMAT)
+            manifest.setdefault("historical_seasons", [])
+            if season_label not in manifest["historical_seasons"]:
+                manifest["historical_seasons"].append(season_label)
+            _write_manifest(output_dir, manifest)
+
+        return UpdateSummary(
+            [],
+            downloaded,
+            [],
+            [],
+            processed_seasons=processed_seasons,
+            skipped_seasons=skipped_seasons,
+            empty_seasons=empty_seasons,
+        )
 
     processed: List[date] = []
     downloaded: List[Path] = []

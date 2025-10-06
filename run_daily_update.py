@@ -2,10 +2,25 @@
 """Entry point for running the NBA data daily update."""
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+
+_NUMERIC_ENV_DEFAULTS = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OPENBLAS_CORETYPE": "HASWELL",
+}
+
+
+def _configure_numeric_environment() -> None:
+    for key, value in _NUMERIC_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
 
 
 def _parse_args(argv: list[str]) -> tuple[bool, Optional[str]]:
@@ -28,6 +43,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     project_root = Path(__file__).resolve().parent
     sys.path.insert(0, str(project_root))
+
+    _configure_numeric_environment()
 
     from nba_db import update
     from nba_db.logger import init_logger

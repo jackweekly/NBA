@@ -6,7 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
+
+
+_NUMERIC_ENV_DEFAULTS = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "OPENBLAS_CORETYPE": "HASWELL",
+}
+
+for _env_key, _env_value in _NUMERIC_ENV_DEFAULTS.items():
+    os.environ.setdefault(_env_key, _env_value)
 
 from nbapredictor.nbadb_sync import update_raw_data
 
@@ -40,6 +53,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-download CSV files even if they already exist.",
     )
     parser.add_argument(
+        "--fetch-all-history",
+        action="store_true",
+        help=(
+            "Download complete seasons instead of iterating day-by-day. "
+            "Outputs are partitioned by season inside leaguegamelog/."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging level (default: INFO).",
@@ -59,6 +80,7 @@ def main() -> None:
         end_date=args.end_date,
         bootstrap_kaggle=args.bootstrap_kaggle,
         force=args.force,
+        fetch_all_history=args.fetch_all_history,
     )
     print(json.dumps(summary.to_dict(), indent=2))
 

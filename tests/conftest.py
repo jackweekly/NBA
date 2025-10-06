@@ -11,6 +11,53 @@ if str(SRC) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+if "pandas" not in sys.modules:
+    try:  # pragma: no cover - optional dependency in tests
+        import pandas as _pandas  # type: ignore # noqa: F401
+    except Exception:  # pragma: no cover - fallback stub
+        sys.modules.pop("pandas", None)
+
+        pandas_stub = types.ModuleType("pandas")
+
+        class _StubDataFrame:  # pragma: no cover - lightweight stand-in
+            def __init__(self, data=None):
+                self._data = list(data or [])
+                self.empty = not bool(self._data)
+
+            def insert(self, index: int, column: str, value):
+                for row in self._data:
+                    row[column] = value
+
+            def to_csv(self, path, index=False):  # noqa: ARG002 - signature parity
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("stub\n")
+
+            def __len__(self) -> int:
+                return len(self._data)
+
+        def _stub_dataframe(data=None):
+            if data is None:
+                return _StubDataFrame()
+            rows = []
+            if isinstance(data, dict):
+                keys = list(data.keys())
+                length = len(next(iter(data.values()), []))
+                for idx in range(length):
+                    rows.append({key: data[key][idx] for key in keys})
+            else:
+                rows = list(data)
+            return _StubDataFrame(rows)
+
+        def _stub_concat(frames, ignore_index=False):  # noqa: ARG002 - parity
+            merged = []
+            for frame in frames:
+                merged.extend(frame._data)
+            return _StubDataFrame(merged)
+
+        pandas_stub.DataFrame = _stub_dataframe  # type: ignore[attr-defined]
+        pandas_stub.concat = _stub_concat  # type: ignore[attr-defined]
+        sys.modules["pandas"] = pandas_stub
+
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
 

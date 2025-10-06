@@ -13,7 +13,8 @@ updates made to [wyattowalsh/nbadb](https://github.com/wyattowalsh/nbadb).
 * Supports optional bootstrapping of the upstream Kaggle dataset when the
   `kaggle` CLI and credentials are available.
 * Produces one CSV file per day inside `data/raw` so downstream modelling
-  code can perform incremental loading.
+  code can perform incremental loading, while season-level backfills are
+  partitioned by season for faster historical refreshes.
 
 ## Installation
 
@@ -36,8 +37,11 @@ python run_daily_update.py --fetch-all-history
 ```
 
 This performs a complete historical backfill by delegating to
-`nba_db.update.daily(fetch_all_history=True)`. To backfill from a specific date
-instead, provide the desired start date:
+`nba_db.update.daily(fetch_all_history=True)`. The historical branch now pulls
+one season at a time and writes the results to
+`data/raw/leaguegamelog/season=<YEAR-YEAR>/part-000.csv`, which drastically
+reduces the number of API calls compared to day-by-day loops. To backfill from a
+specific date instead, provide the desired start date:
 
 ```bash
 python run_daily_update.py 2010-10-01
@@ -45,7 +49,10 @@ python run_daily_update.py 2010-10-01
 
 Invoking the script without arguments only fetches new games since the last run.
 The helper adjusts `sys.path` so `from nba_db import update` resolves correctly
-when executed directly.
+when executed directly. Both the CLI wrapper and the underlying library set
+conservative defaults for the common OpenBLAS and MKL environment variables
+(`OMP_NUM_THREADS=1`, `OPENBLAS_CORETYPE=HASWELL`, etc.) to avoid the "Floating
+point exception" crashes that occasionally surface on virtualised CPUs.
 
 ### One-time bootstrap
 
@@ -58,7 +65,10 @@ via `nba_db.update.init()`. The Kaggle CLI must be installed and authenticated
 through the standard `KAGGLE_USERNAME`/`KAGGLE_KEY` environment variables.
 
 Python callers can continue using `nbapredictor.update_raw_data()` directly if
-they prefer working with the richer API exposed by this repository.
+they prefer working with the richer API exposed by this repository. The helper
+`scripts/update_data.py` mirrors the same behaviour and accepts a
+`--fetch-all-history` flag when you want to trigger the season-wise refresh
+outside of the wrapper that emulates `nba_db`.
 
 ## Testing
 
