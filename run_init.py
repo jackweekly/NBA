@@ -168,7 +168,7 @@ def _download_dataset(dataset_id: str, *, force: bool) -> None:
 
 
 def _log_summary() -> None:
-    frame = pd.read_csv(GAME_CSV)
+    frame = pd.read_csv(GAME_CSV, parse_dates=['game_date'])
     row_count = len(frame)
     if "game_date" in frame.columns and not frame["game_date"].dropna().empty:
         min_date = frame["game_date"].min()
