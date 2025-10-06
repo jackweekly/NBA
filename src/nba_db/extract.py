@@ -20,7 +20,7 @@ SEASON_TYPES = [
     "Regular Season",
     "Playoffs",
     "Pre Season",
-    "In Season Tournament",
+    # "In Season Tournament", # Temporarily disabled due to KeyError: 'resultSet'
 ]
 
 NBA_API_HEADERS = {
