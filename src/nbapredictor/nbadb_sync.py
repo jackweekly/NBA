@@ -31,8 +31,8 @@ HISTORICAL_START_DATE = date(1946, 11, 1)
 SEASON_TYPES: tuple[str, ...] = (
     "Regular Season",
     "Playoffs",
-    "PlayIn",
     "Pre Season",
+    "In Season Tournament",
 )
 
 NBA_API_HEADERS = {

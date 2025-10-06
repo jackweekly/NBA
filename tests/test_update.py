@@ -7,14 +7,16 @@ from requests import exceptions as requests_exceptions
 
 import pandas as pd
 import pytest
+from requests import exceptions as requests_exceptions
 
 from nba_db import update
+from nba_db import paths
 
 
 def _setup_config(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("raw:\n  raw_dir: data/raw\n", encoding="utf-8")
-    monkeypatch.setattr(update, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(paths, "project_root", lambda: tmp_path)
 
 
 def test_daily_incremental_appends(monkeypatch, tmp_path):
@@ -43,6 +45,19 @@ def test_daily_incremental_appends(monkeypatch, tmp_path):
     assert len(saved) == 2
     assert result.appended is True
     assert result.rows_written == len(new_frame)
+    assert result.final_row_count == 2
+
+
+def test_next_start_date_handles_lowercase_columns(monkeypatch, tmp_path):
+    _setup_config(tmp_path, monkeypatch)
+    game_csv = tmp_path / "data/raw/game.csv"
+    game_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "game_id": ["0001"],
+        "game_date": ["2020-01-01"],
+    }).to_csv(game_csv, index=False)
+
+    assert update._next_start_date(game_csv) == date(2020, 1, 2)
 
 
 def test_next_start_date_handles_lowercase_columns(monkeypatch, tmp_path):
@@ -100,7 +115,7 @@ def test_write_dataframe_deduplicates(monkeypatch, tmp_path):
         "SEASON_TYPE": ["Regular Season", "Regular Season"],
     })
 
-    rows = update._write_dataframe(
+    outcome = update._write_dataframe(
         path,
         frame,
         append=False,
@@ -108,7 +123,8 @@ def test_write_dataframe_deduplicates(monkeypatch, tmp_path):
     )
 
     saved = pd.read_csv(path)
-    assert rows == 1
+    assert outcome.appended_rows == 1
+    assert outcome.final_row_count == 1
     assert len(saved) == 1
     assert list(saved.columns) == [col.lower() for col in frame.columns]
 
@@ -134,7 +150,7 @@ def test_write_dataframe_append_deduplicates(monkeypatch, tmp_path):
         "season_type": ["Regular Season"],
     })
 
-    rows = update._write_dataframe(
+    outcome = update._write_dataframe(
         path,
         duplicate,
         append=True,
@@ -142,7 +158,8 @@ def test_write_dataframe_append_deduplicates(monkeypatch, tmp_path):
     )
 
     saved = pd.read_csv(path)
-    assert rows == 0
+    assert outcome.appended_rows == 0
+    assert outcome.final_row_count == 1
     assert len(saved) == 1
 
 

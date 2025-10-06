@@ -1,18 +1,17 @@
 """Data ingestion helpers emulating the ``wyattowalsh/nbadb`` project."""
 from __future__ import annotations
 
+import logging
+import os
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 import pandas as pd
-import time
 from requests import exceptions as requests_exceptions
-try:  # pragma: no cover - optional dependency in the lightweight environment
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover
-    yaml = None  # type: ignore[assignment]
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import (
@@ -22,17 +21,20 @@ from nba_api.stats.endpoints import (
     teaminfocommon,
 )
 
-CONFIG_FILENAME = "config.yaml"
+from .paths import game_log_path, load_config, raw_data_dir
+
 SEASON_TYPES: tuple[str, ...] = (
     "Regular Season",
     "Playoffs",
     "Pre Season",
-    "PlayIn",
+    "In Season Tournament",
 )
 
 
 GAME_LOG_PRIMARY_KEY: tuple[str, str, str] = ("game_id", "team_id", "season_type")
 NUMERIC_KEY_COLUMNS: frozenset[str] = frozenset({"game_id", "team_id"})
+DEFAULT_SEASON_TYPE = "Regular Season"
+REQUEST_SLEEP_SECONDS = 0.5
 
 
 NBA_API_HEADERS = {
@@ -52,7 +54,7 @@ NBA_API_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 20
 SLOW_ENDPOINT_TIMEOUTS: tuple[int, ...] = (
     DEFAULT_TIMEOUT,
     DEFAULT_TIMEOUT * 2,
@@ -64,6 +66,17 @@ MAX_REQUEST_RETRIES = 5
 MAX_BACKOFF_SECONDS = 16
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class WriteOutcome:
+    """Result of persisting a DataFrame to disk."""
+
+    appended_rows: int
+    final_row_count: int
+
+
 @dataclass
 class DailyUpdateResult:
     """Summary describing a ``daily`` update."""
@@ -71,12 +84,14 @@ class DailyUpdateResult:
     output_path: Path
     rows_written: int
     appended: bool
+    final_row_count: int
 
     def to_dict(self) -> dict[str, object]:
         return {
             "output_path": str(self.output_path),
             "rows_written": self.rows_written,
             "appended": self.appended,
+            "final_row_count": self.final_row_count,
         }
 
 
@@ -91,65 +106,6 @@ class InitResult:
     row_counts: dict[str, int]
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _parse_yaml_fallback(text: str) -> dict[str, object]:
-    config: dict[str, object] = {}
-    stack: list[tuple[int, dict[str, object]]] = [(-1, config)]
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip())
-        line = raw_line.strip()
-        if ":" not in line:
-            raise ValueError(f"Invalid config line: {raw_line!r}")
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        current = stack[-1][1]
-        if not value:
-            nested: dict[str, object] = {}
-            current[key] = nested
-            stack.append((indent, nested))
-            continue
-        if value[0] in {'"', "'"} and value[-1] == value[0]:
-            value = value[1:-1]
-        current[key] = value
-    return config
-
-
-def _load_config(config_path: Optional[Path] = None) -> dict[str, object]:
-    path = config_path or _project_root() / CONFIG_FILENAME
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        text = handle.read()
-    if yaml is not None:
-        config = yaml.safe_load(text) or {}
-    else:
-        config = _parse_yaml_fallback(text)
-    return config
-
-
-def _resolve_raw_dir(config: dict[str, object], override: Optional[Path | str] = None) -> Path:
-    if override is not None:
-        raw_dir = Path(override)
-        return raw_dir if raw_dir.is_absolute() else _project_root() / raw_dir
-
-    raw_section = config.get("raw") if isinstance(config, dict) else None
-    if not isinstance(raw_section, dict):
-        raise KeyError("Configuration is missing 'raw' section")
-    raw_dir_value = raw_section.get("raw_dir")
-    if raw_dir_value is None:
-        raise KeyError("Configuration is missing 'raw.raw_dir'")
-    raw_dir = Path(raw_dir_value)
-    return raw_dir if raw_dir.is_absolute() else _project_root() / raw_dir
-
-
 def _season_start(year: int) -> date:
     return date(year, 7, 1)
 
@@ -160,6 +116,65 @@ def _season_end(year: int) -> date:
 
 def _season_label(year: int) -> str:
     return f"{year}-{str(year + 1)[-2:]}"
+
+
+def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``frame`` with lower-case column names."""
+
+    renamed = frame.copy()
+    renamed.columns = [col.lower() for col in frame.columns]
+    return renamed
+
+
+def _standardise_game_log(frame: pd.DataFrame, *, season_type: Optional[str] = None) -> pd.DataFrame:
+    """Apply canonical casing and dtype handling for game log data."""
+
+    canonical = _canonicalize_columns(frame)
+    if "game_date" in canonical.columns:
+        canonical["game_date"] = pd.to_datetime(canonical["game_date"], errors="coerce")
+    if season_type is not None:
+        canonical["season_type"] = season_type
+    elif "season_type" in canonical.columns:
+        canonical["season_type"] = (
+            canonical["season_type"].fillna(DEFAULT_SEASON_TYPE).replace("", DEFAULT_SEASON_TYPE)
+        )
+    else:
+        canonical["season_type"] = DEFAULT_SEASON_TYPE
+    return canonical
+
+
+def _normalise_key_columns(frame: pd.DataFrame, columns: Sequence[str]) -> None:
+    """Normalise key columns in-place for deduplication comparisons."""
+
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        series = frame[column].astype(str).str.strip()
+        if column in NUMERIC_KEY_COLUMNS:
+            series = series.str.lstrip("0").replace({"": "0"})
+        frame[column] = series
+
+
+def _deduplicate_game_log(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate rows from a canonical game log frame."""
+
+    canonical = _canonicalize_columns(frame)
+    available_subset = [column for column in GAME_LOG_PRIMARY_KEY if column in canonical.columns]
+    if not available_subset:
+        return canonical.drop_duplicates(ignore_index=True)
+    return canonical.drop_duplicates(subset=available_subset, keep="last", ignore_index=True)
+
+
+def _read_game_log(path: Path) -> pd.DataFrame:
+    """Load the consolidated game log, applying the canonical schema."""
+
+    if not path.exists():
+        return pd.DataFrame()
+    frame = pd.read_csv(path)
+    if frame.empty:
+        frame.columns = [col.lower() for col in frame.columns]
+        return frame
+    return _standardise_game_log(frame)
 
 
 def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -228,12 +243,12 @@ def _fetch_season_frame(
             ).get_data_frames()[0],
         )
         if not frame.empty:
-            frame.insert(0, "SEASON_TYPE", season_type)
-            frames.append(_canonicalize_columns(frame))
+            frames.append(_standardise_game_log(frame, season_type=season_type))
+        time.sleep(REQUEST_SLEEP_SECONDS)
     if not frames:
         return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True)
-    return _canonicalize_columns(combined)
+    return _standardise_game_log(combined)
 
 
 def get_league_game_log_all() -> pd.DataFrame:
@@ -287,8 +302,7 @@ def _next_start_date(game_csv_path: Path) -> date:
         raise FileNotFoundError(
             "Cannot infer start date because game.csv does not exist."
         )
-    frame = pd.read_csv(game_csv_path)
-    frame = _canonicalize_columns(frame)
+    frame = _read_game_log(game_csv_path)
     if frame.empty:
         raise ValueError("Existing game.csv is empty")
     dates = _infer_game_date(frame)
@@ -298,77 +312,68 @@ def _next_start_date(game_csv_path: Path) -> date:
     return (last.date() + timedelta(days=1))
 
 
+def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
+    """Write ``frame`` to ``path`` using an atomic replace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    ) as handle:
+        temp_path = Path(handle.name)
+        frame.to_csv(handle, index=False)
+    os.replace(temp_path, path)
+
+
 def _write_dataframe(
     path: Path,
     frame: pd.DataFrame,
     *,
     append: bool,
     deduplicate_subset: Optional[Sequence[str]] = None,
-) -> int:
-    """Persist ``frame`` to ``path`` while optionally removing duplicates.
+) -> WriteOutcome:
+    """Persist ``frame`` to ``path`` while optionally removing duplicates."""
 
-    When ``deduplicate_subset`` is provided, both the incoming ``frame`` and any
-    existing data on disk are canonicalised to lower-case column names and
-    deduplicated using the supplied subset. The function returns the count of
-    unique rows contributed by ``frame``.
-    """
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if deduplicate_subset is not None:
-        frame_to_write = _canonicalize_columns(frame)
-        subset = [column.lower() for column in deduplicate_subset]
-        available_subset_frame = [column for column in subset if column in frame_to_write.columns]
-        if available_subset_frame:
-            _normalise_key_columns(frame_to_write, available_subset_frame)
-            frame_to_write = frame_to_write.drop_duplicates(
-                subset=available_subset_frame,
-                keep="last",
-                ignore_index=True,
-            )
-        else:
-            frame_to_write = frame_to_write.drop_duplicates(ignore_index=True)
+    subset = [column.lower() for column in (deduplicate_subset or [])]
+    if subset:
+        existing = _read_game_log(path) if append else pd.DataFrame()
+        frame_to_write = _standardise_game_log(frame)
     else:
+        existing = pd.read_csv(path) if append and path.exists() else pd.DataFrame()
         frame_to_write = frame.copy()
-        subset = []
 
-    if append and path.exists():
-        if deduplicate_subset is None:
-            frame_to_write.to_csv(path, mode="a", header=False, index=False)
-            return len(frame_to_write)
+    existing_count = len(existing)
 
-        existing = pd.read_csv(path)
-        existing = _canonicalize_columns(existing)
-        shared_subset = [column for column in subset if column in existing.columns]
-        if shared_subset:
-            _normalise_key_columns(existing, shared_subset)
-            _normalise_key_columns(frame_to_write, shared_subset)
-            existing_keys = set(existing[shared_subset].itertuples(index=False, name=None))
-            incoming_keys = [
-                row
-                for row in frame_to_write[shared_subset].itertuples(index=False, name=None)
-                if row not in existing_keys
-            ]
-            appended_count = len(incoming_keys)
-        else:
-            appended_count = len(frame_to_write)
+    if not append and frame_to_write.empty:
+        return WriteOutcome(appended_rows=0, final_row_count=0)
+    if append and frame_to_write.empty:
+        return WriteOutcome(appended_rows=0, final_row_count=existing_count)
 
+    if append and not existing.empty:
         combined = pd.concat([existing, frame_to_write], ignore_index=True)
-        available_subset_combined = [column for column in subset if column in combined.columns]
-        if available_subset_combined:
-            _normalise_key_columns(combined, available_subset_combined)
-            combined = combined.drop_duplicates(
-                subset=available_subset_combined,
-                keep="last",
-                ignore_index=True,
-            )
+    else:
+        combined = frame_to_write.copy()
+
+    if subset:
+        available_subset = [column for column in subset if column in combined.columns]
+        if available_subset:
+            _normalise_key_columns(combined, available_subset)
+            combined = combined.drop_duplicates(subset=available_subset, keep="first", ignore_index=True)
         else:
             combined = combined.drop_duplicates(ignore_index=True)
-        combined.to_csv(path, index=False)
-        return appended_count
+    else:
+        combined = combined.drop_duplicates(ignore_index=True)
 
-    frame_to_write.to_csv(path, index=False)
-    return len(frame_to_write)
+    final_row_count = len(combined)
+    appended_rows = final_row_count - existing_count
+
+    _atomic_write_csv(path, combined)
+    return WriteOutcome(appended_rows=appended_rows, final_row_count=final_row_count)
 
 
 def _call_with_retry(
@@ -417,6 +422,7 @@ def _fetch_all_players() -> pd.DataFrame:
         )
         if not frame.empty:
             frames.append(frame)
+        time.sleep(REQUEST_SLEEP_SECONDS)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -437,6 +443,7 @@ def _fetch_all_teams() -> pd.DataFrame:
         )
         if not frame.empty:
             frames.append(frame)
+        time.sleep(REQUEST_SLEEP_SECONDS)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -456,6 +463,7 @@ def _fetch_game_summaries(game_ids: Sequence[str]) -> pd.DataFrame:
         )
         if not frame.empty:
             frames.append(frame)
+        time.sleep(REQUEST_SLEEP_SECONDS)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -468,38 +476,107 @@ def daily(
     end_date: Optional[str] = None,
     output_dir: Optional[Path | str] = None,
 ) -> DailyUpdateResult:
-    config = _load_config()
-    raw_dir = _resolve_raw_dir(config, override=output_dir)
+    config = load_config()
+    raw_dir = raw_data_dir(config=config, override=output_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    game_csv_path = raw_dir / "game.csv"
+    game_csv_path = game_log_path(config=config, override=output_dir)
+
+    today_local = date.today()
 
     if fetch_all_history:
+        LOGGER.info("Starting full-history refresh into %s", game_csv_path)
         frame = get_league_game_log_all()
-        rows = _write_dataframe(
+        outcome = _write_dataframe(
             game_csv_path,
             frame,
             append=False,
             deduplicate_subset=GAME_LOG_PRIMARY_KEY,
         )
-        return DailyUpdateResult(game_csv_path, rows, appended=False)
+        LOGGER.info(
+            "Full-history refresh complete; final row count %s",
+            outcome.final_row_count,
+        )
+        return DailyUpdateResult(
+            game_csv_path,
+            outcome.appended_rows,
+            appended=False,
+            final_row_count=outcome.final_row_count,
+        )
+
+    if not game_csv_path.exists():
+        raise FileNotFoundError("Cannot run incremental update before bootstrap is written")
 
     start = date.fromisoformat(start_date) if start_date else _next_start_date(game_csv_path)
     stop = date.fromisoformat(end_date) if end_date else None
+
+    if start >= today_local:
+        LOGGER.info("No new games to fetch; latest recorded date is %s", (start - timedelta(days=1)).isoformat())
+        existing = _read_game_log(game_csv_path)
+        return DailyUpdateResult(
+            game_csv_path,
+            0,
+            appended=True,
+            final_row_count=len(existing),
+        )
+
+    if stop is not None:
+        stop = min(stop, today_local - timedelta(days=1))
+        if stop < start:
+            LOGGER.info("Requested update window %s-%s is empty", start.isoformat(), stop.isoformat())
+            existing = _read_game_log(game_csv_path)
+            return DailyUpdateResult(
+                game_csv_path,
+                0,
+                appended=True,
+                final_row_count=len(existing),
+            )
+
     frame = get_league_game_log_from_date(start, stop)
+    frame = _standardise_game_log(frame)
     if frame.empty:
-        return DailyUpdateResult(game_csv_path, 0, appended=game_csv_path.exists())
-    rows = _write_dataframe(
+        LOGGER.info(
+            "No games returned between %s and %s",
+            start.isoformat(),
+            (stop or today_local - timedelta(days=1)).isoformat(),
+        )
+        existing = _read_game_log(game_csv_path)
+        return DailyUpdateResult(
+            game_csv_path,
+            0,
+            appended=True,
+            final_row_count=len(existing),
+        )
+
+    valid_dates = frame["game_date"].dropna()
+    if not valid_dates.empty:
+        LOGGER.info(
+            "Fetched %s rows covering %s → %s",
+            len(frame),
+            valid_dates.min().date().isoformat(),
+            valid_dates.max().date().isoformat(),
+        )
+    else:
+        LOGGER.info("Fetched %s rows with no valid game_date values", len(frame))
+
+    existed_before = game_csv_path.exists()
+    outcome = _write_dataframe(
         game_csv_path,
         frame,
-        append=game_csv_path.exists(),
+        append=existed_before,
         deduplicate_subset=GAME_LOG_PRIMARY_KEY,
     )
-    return DailyUpdateResult(game_csv_path, rows, appended=game_csv_path.exists())
+    LOGGER.info("Final game log row count: %s", outcome.final_row_count)
+    return DailyUpdateResult(
+        game_csv_path,
+        outcome.appended_rows,
+        appended=existed_before,
+        final_row_count=outcome.final_row_count,
+    )
 
 
 def init(output_dir: Optional[Path | str] = None) -> InitResult:
-    config = _load_config()
-    raw_dir = _resolve_raw_dir(config, override=output_dir)
+    config = load_config()
+    raw_dir = raw_data_dir(config=config, override=output_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     player_path = raw_dir / "common_player_info.csv"
@@ -513,17 +590,17 @@ def init(output_dir: Optional[Path | str] = None) -> InitResult:
     summaries_frame = _fetch_game_summaries(games_frame["GAME_ID"].tolist()) if not games_frame.empty else pd.DataFrame()
 
     row_counts = {
-        "players": _write_dataframe(player_path, players_frame, append=False) if not players_frame.empty else 0,
-        "teams": _write_dataframe(team_path, teams_frame, append=False) if not teams_frame.empty else 0,
+        "players": _write_dataframe(player_path, players_frame, append=False).final_row_count if not players_frame.empty else 0,
+        "teams": _write_dataframe(team_path, teams_frame, append=False).final_row_count if not teams_frame.empty else 0,
         "games": _write_dataframe(
             game_path,
             games_frame,
             append=False,
             deduplicate_subset=GAME_LOG_PRIMARY_KEY,
-        )
+        ).final_row_count
         if not games_frame.empty
         else 0,
-        "game_summaries": _write_dataframe(game_summary_path, summaries_frame, append=False) if not summaries_frame.empty else 0,
+        "game_summaries": _write_dataframe(game_summary_path, summaries_frame, append=False).final_row_count if not summaries_frame.empty else 0,
     }
 
     return InitResult(
@@ -538,6 +615,7 @@ def init(output_dir: Optional[Path | str] = None) -> InitResult:
 __all__ = [
     "DailyUpdateResult",
     "InitResult",
+    "WriteOutcome",
     "daily",
     "get_league_game_log_all",
     "get_league_game_log_from_date",
