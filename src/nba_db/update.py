@@ -4,9 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, timedelta, datetime
-from pandas.tseries.offsets import MonthEnd
-from pandas import Timestamp
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 GAME_LOG_PRIMARY_KEY = ("game_id", "team_id", "season_type")
 DEFAULT_SEASON_TYPE = "Regular Season"
+HISTORICAL_START_DATE = date(1946, 11, 1)
 
 
 @dataclass(slots=True)
@@ -42,6 +41,10 @@ class DailyUpdateResult:
 
 def _ensure_raw_dir() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_output_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
@@ -122,12 +125,44 @@ def daily(
     *,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    fetch_all_history: bool = False,
+    output_path: Optional[Path] = None,
 ) -> DailyUpdateResult:
     """Fetch and append the latest NBA games into ``data/raw/game.csv``."""
 
-    _ensure_raw_dir()
+    target_path = Path(output_path) if output_path is not None else GAME_CSV
 
-    existing = _read_existing(GAME_CSV)
+    _ensure_raw_dir()
+    _ensure_output_dir(target_path)
+
+    fetch_until = date.fromisoformat(end_date) if end_date else None
+
+    if fetch_all_history:
+        if start_date:
+            fetch_from = date.fromisoformat(start_date)
+        else:
+            fetch_from = HISTORICAL_START_DATE
+
+        LOGGER.info(
+            "Fetching full historical league game log from %s%s",
+            fetch_from.isoformat(),
+            f" through {fetch_until.isoformat()}" if fetch_until else "",
+        )
+        new_rows = extract.get_league_game_log_from_date(fetch_from, fetch_until)
+        new_rows = _canonicalise(new_rows)
+        if new_rows.empty:
+            LOGGER.info("NBA API returned no rows for the requested historical range")
+            _atomic_write_csv(new_rows, target_path)
+            return DailyUpdateResult(target_path, 0, appended=False, final_row_count=0)
+
+        new_rows = _deduplicate(new_rows)
+        _log_fetch_window(new_rows)
+        _atomic_write_csv(new_rows, target_path)
+        final_count = len(new_rows)
+        LOGGER.info("Wrote complete historical game log with %s rows to %s", final_count, target_path)
+        return DailyUpdateResult(target_path, final_count, appended=False, final_row_count=final_count)
+
+    existing = _read_existing(target_path)
 
     today_local = date.today()
 
@@ -141,35 +176,37 @@ def daily(
             )
         fetch_from = latest + timedelta(days=1)
 
-    if end_date:
-        fetch_until = date.fromisoformat(end_date)
-    else:
-        fetch_until = None
+    if fetch_until and fetch_from > fetch_until:
+        LOGGER.info(
+            "Start date %s is after requested end date %s; nothing to fetch",
+            fetch_from.isoformat(),
+            fetch_until.isoformat(),
+        )
+        return DailyUpdateResult(target_path, 0, appended=True, final_row_count=len(existing))
 
-    if fetch_from >= today_local:
+    if fetch_until is None and fetch_from >= today_local:
         LOGGER.info("No new games to fetch; latest recorded date is %s", (fetch_from - timedelta(days=1)))
-        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing))
+        return DailyUpdateResult(target_path, 0, appended=True, final_row_count=len(existing))
 
     new_rows = extract.get_league_game_log_from_date(fetch_from, fetch_until)
     new_rows = _canonicalise(new_rows)
 
     if new_rows.empty:
         LOGGER.info("NBA API returned no games for %s onward", fetch_from.isoformat())
-        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing))
+        return DailyUpdateResult(target_path, 0, appended=True, final_row_count=len(existing))
 
     _log_fetch_window(new_rows)
 
     combined = pd.concat([existing, new_rows], ignore_index=True)
     combined = _deduplicate(combined)
 
-    _atomic_write_csv(combined, GAME_CSV)
+    _atomic_write_csv(combined, target_path)
     final_count = len(combined)
     appended_rows = max(final_count - len(existing), 0)
 
     LOGGER.info("Final game.csv row count: %s", final_count)
 
-    return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_count)
+    return DailyUpdateResult(target_path, appended_rows, appended=True, final_row_count=final_count)
 
-    LOGGER.info(f"Daily update wrote {len(new_rows)} new rows to {GAME_CSV} (appended={appended})")
 
 __all__ = ["DailyUpdateResult", "daily"]

@@ -35,3 +35,4 @@ data/*.duckdb
 build/
 dist/
 *.egg-info/
+csv/

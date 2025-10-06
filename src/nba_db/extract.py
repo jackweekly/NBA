@@ -8,7 +8,7 @@ from datetime import date
 from typing import Optional
 
 import pandas as pd
-from nba_api.stats.endpoints import leaguegamelog
+import requests
 from requests import exceptions as requests_exceptions
 
 from .utils import get_proxies
@@ -23,6 +23,7 @@ SEASON_TYPES = [
     "In Season Tournament",
 ]
 
+NBA_API_URL = "https://stats.nba.com/stats/leaguegamelog"
 NBA_API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -95,6 +96,51 @@ def _normalise_frame(frame: pd.DataFrame, season_type: str) -> pd.DataFrame:
     return normalised
 
 
+def _fetch_leaguegamelog(
+    *,
+    season: str,
+    season_type: str,
+    formatted_from: Optional[str],
+    formatted_to: Optional[str],
+    timeout: int,
+    proxy: Optional[str],
+) -> pd.DataFrame:
+    params = {
+        "Counter": 0,
+        "Direction": "ASC",
+        "LeagueID": "00",
+        "PlayerOrTeam": "T",
+        "Season": season,
+        "SeasonType": season_type,
+        "Sorter": "DATE",
+        "DateFrom": formatted_from or "",
+        "DateTo": formatted_to or "",
+    }
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    response = requests.get(
+        NBA_API_URL,
+        params=params,
+        headers=NBA_API_HEADERS,
+        timeout=timeout,
+        proxies=proxies,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    datasets = payload.get("resultSets") or payload.get("resultSet")
+    if isinstance(datasets, dict):
+        target = datasets
+    elif isinstance(datasets, list) and datasets:
+        target = next((item for item in datasets if item.get("name") == "LeagueGameLog"), datasets[0])
+    else:
+        target = {}
+
+    headers = target.get("headers", [])
+    rows = target.get("rowSet", [])
+    return pd.DataFrame(rows, columns=headers)
+
+
 def get_league_game_log_from_date(
     start: date,
     end: Optional[date] = None,
@@ -130,17 +176,26 @@ def get_league_game_log_from_date(
             proxy = random.choice(proxies) if proxies else None
 
             def _fetch() -> pd.DataFrame:
-                endpoint = leaguegamelog.LeagueGameLog(
-                    season=season,
-                    season_type_all_star=season_type,
-                    date_from_nullable=formatted_from,
-                    date_to_nullable=formatted_to,
-                    timeout=timeout,
-                    headers=NBA_API_HEADERS,
-                    proxy=proxy,
-                )
-                frames_list = endpoint.get_data_frames()
-                return frames_list[0] if frames_list else pd.DataFrame()
+                try:
+                    return _fetch_leaguegamelog(
+                        season=season,
+                        season_type=season_type,
+                        formatted_from=formatted_from,
+                        formatted_to=formatted_to,
+                        timeout=timeout,
+                        proxy=proxy,
+                    )
+                except requests_exceptions.HTTPError as exc:
+                    status_code = getattr(exc.response, "status_code", None)
+                    if status_code in {400, 404}:
+                        LOGGER.info(
+                            "No data for season=%s type=%s (HTTP %s); skipping",
+                            season,
+                            season_type,
+                            status_code,
+                        )
+                        return pd.DataFrame()
+                    raise
 
             frame = _call_with_retry(f"leaguegamelog {season} {season_type}", _fetch)
             if not frame.empty:
