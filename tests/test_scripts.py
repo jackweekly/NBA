@@ -34,9 +34,9 @@ def test_daily_fetch_all_history(monkeypatch, tmp_path):
     assert records == [{"called": True}]
     assert result.output_path == tmp_path / "data/raw/game.csv"
     saved = pd.read_csv(result.output_path)
-    expected = frame.copy()
-    saved["GAME_ID"] = saved["GAME_ID"].astype(int)
-    expected["GAME_ID"] = expected["GAME_ID"].astype(int)
+    expected = frame.rename(columns=str.lower)
+    saved["game_id"] = saved["game_id"].astype(int)
+    expected["game_id"] = expected["game_id"].astype(int)
     pd.testing.assert_frame_equal(saved, expected, check_dtype=False)
 
 
