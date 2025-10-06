@@ -20,7 +20,7 @@ SEASON_TYPES = [
     "Regular Season",
     "Playoffs",
     "Pre Season",
-    # "In Season Tournament", # Temporarily disabled due to KeyError: 'resultSet'
+    "In Season Tournament",
 ]
 
 NBA_API_HEADERS = {
@@ -63,54 +63,28 @@ def _format_for_api(value: Optional[date]) -> Optional[str]:
     return value.strftime("%m/%d/%Y") if value else None
 
 
-def _call_with_retry(description: str, func):
-    delay = 4
-    attempts = 0
-    while True:
-        try:
-            return func()
-        except requests_exceptions.RequestException as exc:
-            attempts += 1
-            if attempts >= MAX_RETRIES:
-                raise RuntimeError(f"Failed to fetch {description}") from exc
-            sleep_for = min(delay, MAX_BACKOFF_SECONDS)
-            LOGGER.warning(
-                "%s failed (%s); retrying in %ss", description, exc.__class__.__name__, sleep_for
-            )
-            time.sleep(sleep_for)
-            delay = min(delay * 2, MAX_BACKOFF_SECONDS)
 
 
-def _normalise_frame(frame: pd.DataFrame, season_type: str) -> pd.DataFrame:
-    if frame.empty:
-        frame.columns = [col.lower() for col in frame.columns]
-        frame["season_type"] = season_type
-        return frame
 
-    normalised = frame.copy()
-    normalised.columns = normalised.columns.str.lower()
-    if "game_date" in normalised.columns:
-        normalised["game_date"] = pd.to_datetime(normalised["game_date"], errors="coerce")
-    normalised["season_type"] = season_type
-    return normalised
+
 
 
 def get_league_game_log_from_date(
-    start: date,
-    end: Optional[date] = None,
+    datefrom: date,
+    dateto: Optional[date] = None,
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> pd.DataFrame:
-    """Fetch league game logs between ``start`` and ``end`` (inclusive)."""
+    """Fetch league game logs between ``datefrom`` and ``dateto`` (inclusive)."""
 
     today = date.today()
     latest_season_year = _latest_started_season_year(today)
-    effective_end = end or today
+    effective_end = dateto or today
     effective_end_year = min(_season_year_for_date(effective_end), latest_season_year)
-    start_year = _season_year_for_date(start)
+    start_year = _season_year_for_date(datefrom)
 
     if start_year > latest_season_year:
-        LOGGER.info("Start date %s is in a future season; returning empty frame", start)
+        LOGGER.info("Start date %s is in a future season; returning empty frame", datefrom)
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
@@ -120,42 +94,52 @@ def get_league_game_log_from_date(
         season = _season_label(season_year)
         season_start = date(season_year, 7, 1)
         season_end = date(season_year + 1, 6, 30)
-        season_from = start if season_year == start_year else season_start
+        season_from = datefrom if season_year == start_year else season_start
         season_to = effective_end if season_year == effective_end_year else season_end
 
         for season_type in SEASON_TYPES:
             formatted_from = _format_for_api(season_from if season_from >= season_start else season_start)
             formatted_to = _format_for_api(season_to if season_to <= season_end else season_end)
 
-            proxy = random.choice(proxies) if proxies else None
-
-            def _fetch() -> pd.DataFrame:
-                endpoint = leaguegamelog.LeagueGameLog(
-                    season=season,
-                    season_type_all_star=season_type,
-                    date_from_nullable=formatted_from,
-                    date_to_nullable=formatted_to,
-                    timeout=timeout,
-                    headers=NBA_API_HEADERS,
-                    proxy=proxy,
-                )
-                frames_list = endpoint.get_data_frames()
-                return frames_list[0] if frames_list else pd.DataFrame()
-
-            frame = _call_with_retry(f"leaguegamelog {season} {season_type}", _fetch)
-            if not frame.empty:
-                normalised = _normalise_frame(frame, season_type)
-                frames.append(normalised)
-            time.sleep(REQUEST_SLEEP_SECONDS)
+            while True:
+                try:
+                    proxy_to_use = random.choice(proxies) if proxies else None
+                    endpoint = leaguegamelog.LeagueGameLog(
+                        season=season,
+                        season_type_all_star=season_type,
+                        date_from_nullable=formatted_from,
+                        date_to_nullable=formatted_to,
+                        timeout=10, # <-- was DEFAULT_TIMEOUT, make it less flaky
+                        headers=NBA_API_HEADERS,
+                        proxy=proxy_to_use,
+                    )
+                    dfs = endpoint.get_data_frames()
+                    if not dfs:
+                        LOGGER.info(f"No data returned for {season_type} from {formatted_from} to {formatted_to}.")
+                        break
+                    df = dfs[0]
+                    # normalize here so callers can rely on shape
+                    df.columns = df.columns.str.lower()
+                    if "game_date" in df.columns:
+                        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+                    df["season_type"] = season_type
+                    # DO NOT self-merge; keep per-team rows
+                    frames.append(df)
+                    break
+                except requests_exceptions.RequestException as e:
+                    LOGGER.error(f"RequestException for {season_type} from {formatted_from} to {formatted_to}: {e}")
+                    time.sleep(5) # Sleep for 5 seconds before retrying
+                    continue
+            time.sleep(REQUEST_SLEEP_SECONDS) # Politeness sleep after each successful call
 
     if not frames:
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True)
     if "game_date" in combined.columns:
-        upper_bound = end or effective_end
+        upper_bound = dateto or effective_end
         mask = combined["game_date"].isna() | (
-            (combined["game_date"].dt.date >= start) &
+            (combined["game_date"].dt.date >= datefrom) &
             (combined["game_date"].dt.date <= upper_bound)
         )
         combined = combined[mask]

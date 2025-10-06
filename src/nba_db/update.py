@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -18,6 +19,37 @@ LOGGER = logging.getLogger(__name__)
 
 GAME_LOG_PRIMARY_KEY = ("game_id", "team_id", "season_type")
 DEFAULT_SEASON_TYPE = "Regular Season"
+
+
+def _canonicalise(df):
+    """Lowercase columns and parse game_date; noop on None/empty."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    df.columns = df.columns.str.lower()
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    return df
+
+def _atomic_write_csv(df: pd.DataFrame, out_path: Path | str):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=out_path.parent, suffix=".tmp") as tmp:
+        df.to_csv(tmp.name, index=False)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    os.replace(tmp_name, out_path)
+
+def _log_fetch_window(df: pd.DataFrame):
+    df = _canonicalise(df)
+    if df is None or df.empty:
+        LOGGER.info("Fetched 0 rows.")
+        return
+    if "game_date" in df.columns:
+        LOGGER.info(f"Fetched {len(df)} new rows covering {df['game_date'].min()} \u2192 {df['game_date'].max()}")
+    else:
+        LOGGER.info(f"Fetched {len(df)} new rows (no game_date column present).")
 
 
 @dataclass(slots=True)
@@ -38,8 +70,7 @@ class DailyUpdateResult:
         }
 
 
-def _ensure_raw_dir() -> None:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
@@ -67,39 +98,16 @@ def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
     return canonical
 
 
-def _read_existing(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found. Run run_init.py first to download the Kaggle seed dataset."
-        )
-
-    frame = pd.read_csv(path)
-    if frame.empty:
-        frame.columns = [col.lower() for col in frame.columns]
-        return frame
-    return _canonicalise(frame)
 
 
-def _latest_game_date(frame: pd.DataFrame) -> Optional[date]:
-    if "game_date" not in frame.columns:
-        return None
-    valid = frame["game_date"].dropna()
-    if valid.empty:
-        return None
-    return valid.max().date()
 
 
-def _deduplicate(frame: pd.DataFrame) -> pd.DataFrame:
-    subset = [column for column in GAME_LOG_PRIMARY_KEY if column in frame.columns]
-    if not subset:
-        return frame.drop_duplicates(ignore_index=True)
-    return frame.drop_duplicates(subset=subset, keep="first", ignore_index=True)
 
 
-def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
-    tmp_path = path.with_suffix(".tmp")
-    frame.to_csv(tmp_path, index=False)
-    os.replace(tmp_path, path)
+
+
+
+
 
 
 def _log_fetch_window(new_rows: pd.DataFrame) -> None:
@@ -130,48 +138,59 @@ def daily(
 ) -> DailyUpdateResult:
     """Fetch and append the latest NBA games into ``data/raw/game.csv``."""
 
-    _ensure_raw_dir()
-
-    existing = _read_existing(GAME_CSV)
-
     today_local = date.today()
 
-    if start_date:
-        fetch_from = date.fromisoformat(start_date)
+    # read existing and canonicalise before using it
+    if GAME_CSV.exists():
+        existing_game_df = pd.read_csv(GAME_CSV)
+        existing_game_df = _canonicalise(existing_game_df)
+        if not existing_game_df.empty:
+            fetch_from_date = existing_game_df["game_date"].max()
+            # bump +1 day only for normal daily (no explicit backfill)
+            if not start_date:
+                fetch_from_date = (pd.to_datetime(fetch_from_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     else:
-        latest = _latest_game_date(existing)
-        if latest is None:
-            raise RuntimeError(
-                "Existing game.csv does not contain any valid game_date values; cannot resume update"
-            )
-        fetch_from = latest + timedelta(days=1)
+        existing_game_df = pd.DataFrame()
+
+    if start_date:
+        fetch_from = start_date
+    elif not existing_game_df.empty:
+        fetch_from = (pd.to_datetime(existing_game_df["game_date"].max()) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        # If no existing data and no start_date, start from a reasonable default, e.g., 2023-01-01
+        fetch_from = "2023-01-01" # Or some other sensible default
 
     if end_date:
-        fetch_until = date.fromisoformat(end_date)
+        fetch_until = end_date
     else:
-        fetch_until = None
+        fetch_until = today_local.strftime("%Y-%m-%d")
 
-    if fetch_from >= today_local:
-        LOGGER.info("No new games to fetch; latest recorded date is %s", (fetch_from - timedelta(days=1)))
-        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing))
-
+    # ... after you obtain new_games_df ...
     new_rows = extract.get_league_game_log_from_date(fetch_from, fetch_until)
     new_rows = _canonicalise(new_rows)
-
-    if new_rows.empty:
-        LOGGER.info("NBA API returned no games for %s onward", fetch_from.isoformat())
-        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing))
+    if new_rows is None or new_rows.empty:
+        LOGGER.info("No new games found. Exiting...")
+        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing_game_df))
 
     _log_fetch_window(new_rows)
 
-    combined = pd.concat([existing, new_rows], ignore_index=True)
-    combined = _deduplicate(combined)
+    # merge, dedup on lowercase keys, then atomic write
+    if existing_game_df is not None and not existing_game_df.empty:
+        combined_df = pd.concat([existing_game_df, new_rows], ignore_index=True)
+    else:
+        combined_df = new_rows
 
-    _atomic_write_csv(combined, GAME_CSV)
-    final_count = len(combined)
-    appended_rows = max(final_count - len(existing), 0)
+    # ensure season_type exists (Kaggle sometimes lacks it)
+    if "season_type" not in combined_df.columns:
+        combined_df["season_type"] = "Regular Season"
 
-    LOGGER.info("Final game.csv row count: %s", final_count)
+    combined_df.drop_duplicates(subset=["game_id", "team_id", "season_type"], keep="first", inplace=True)
+
+    _atomic_write_csv(combined_df, GAME_CSV)
+    final_count = len(combined_df)
+    appended_rows = max(final_count - len(existing_game_df), 0)
+
+    LOGGER.info(f"Wrote {final_count} total rows to {GAME_CSV}")
 
     return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_count)
 
