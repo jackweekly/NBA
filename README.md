@@ -25,23 +25,40 @@ The package depends on `requests`, `pandas`, `nba_api`, and `python-dateutil`.
 
 ## Usage
 
-The `scripts/update_data.py` helper can be executed directly:
+The repository mirrors the interface provided by the
+[`wyattowalsh/nbadb`](https://github.com/wyattowalsh/nbadb) utilities so you can
+drive updates with lightweight scripts at the project root.
+
+### Daily updates
 
 ```bash
-python scripts/update_data.py --start-date 2024-10-01
+python run_daily_update.py --fetch-all-history
 ```
 
-This command will fetch league game logs from 1 October 2024 until yesterday
-and store them under `data/raw`. When neither `--start-date` nor a manifest
-value is provided the updater will backfill every day from 1 November 1946 so
-your local archive always reflects the full NBA/BAA history. To run from
-Python, call `nbapredictor.update_raw_data()`.
+This performs a complete historical backfill by delegating to
+`nba_db.update.daily(fetch_all_history=True)`. To backfill from a specific date
+instead, provide the desired start date:
 
-If the [Kaggle dataset](https://www.kaggle.com/datasets/wyattowalsh/basketball)
-should be downloaded before the incremental update, pass
-`--bootstrap-kaggle` (or set `bootstrap_kaggle=True` when using the Python API).
-This requires the `kaggle` CLI to be installed and authenticated via the
-standard `KAGGLE_USERNAME` and `KAGGLE_KEY` environment variables.
+```bash
+python run_daily_update.py 2010-10-01
+```
+
+Invoking the script without arguments only fetches new games since the last run.
+The helper adjusts `sys.path` so `from nba_db import update` resolves correctly
+when executed directly.
+
+### One-time bootstrap
+
+```bash
+python run_init.py
+```
+
+This seeds the local data directory by downloading the upstream Kaggle dataset
+via `nba_db.update.init()`. The Kaggle CLI must be installed and authenticated
+through the standard `KAGGLE_USERNAME`/`KAGGLE_KEY` environment variables.
+
+Python callers can continue using `nbapredictor.update_raw_data()` directly if
+they prefer working with the richer API exposed by this repository.
 
 ## Testing
 

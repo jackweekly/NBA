@@ -4,7 +4,9 @@ import json
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
+import pytest
+
+pd = pytest.importorskip("pandas")
 
 from nbapredictor import nbadb_sync
 

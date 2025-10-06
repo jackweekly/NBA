@@ -11,7 +11,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-import pandas as pd
+try:  # pragma: no cover - optional dependency for lightweight environments
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover - defer error until used
+    pd = None  # type: ignore[assignment]
 import requests
 from dateutil import parser as date_parser
 from nba_api.stats.endpoints import leaguegamelog
@@ -103,6 +106,8 @@ def _season_for_date(target_date: date) -> str:
 
 
 def _fetch_game_logs_for_date(target_date: date, retries: int = 3, pause: float = 1.5) -> pd.DataFrame:
+    if pd is None:  # pragma: no cover - dependency is optional in unit tests
+        raise ModuleNotFoundError("pandas is required to fetch game logs")
     season = _season_for_date(target_date)
     date_str = target_date.strftime("%m/%d/%Y")
     frames: List[pd.DataFrame] = []
