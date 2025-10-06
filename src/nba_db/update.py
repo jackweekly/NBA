@@ -20,13 +20,6 @@ LOGGER = logging.getLogger(__name__)
 GAME_LOG_PRIMARY_KEY = ("game_id", "team_id", "season_type")
 DEFAULT_SEASON_TYPE = "Regular Season"
 
-DTYPE_HINTS = {
-    "GAME_ID": str,
-    "TEAM_ID": str,
-    "season_type": "category",
-    "WL": "category",
-    "TEAM_ABBREVIATION": "category",
-}
 
 
 def _canonicalise(df):
@@ -51,7 +44,7 @@ def _atomic_write_csv(df: pd.DataFrame, out_path: Path | str):
 
 def _get_last_updated_date() -> date:
     if GAME_CSV.exists():
-        existing_game_df = pd.read_csv(GAME_CSV, usecols=["game_date", "game_id", "season_id", "team_id_home", "team_id_away", "season_type"], dtype=DTYPE_HINTS)
+        existing_game_df = pd.read_csv(GAME_CSV, usecols=["game_date", "game_id", "season_id", "team_id_home", "team_id_away", "season_type"], dtype_backend="pyarrow")
         existing_game_df = _canonicalise(existing_game_df)
         if not existing_game_df.empty and "game_date" in existing_game_df.columns:
             return existing_game_df["game_date"].max().date()
@@ -167,7 +160,7 @@ def daily(
 
     # read existing and canonicalise before using it
     if GAME_CSV.exists():
-        existing_game_df = pd.read_csv(GAME_CSV, dtype=DTYPE_HINTS)
+        existing_game_df = pd.read_csv(GAME_CSV, dtype_backend="pyarrow")
         existing_game_df = _canonicalise(existing_game_df)
     else:
         existing_game_df = pd.DataFrame()
@@ -176,6 +169,7 @@ def daily(
     fetch_from, fetch_until = _get_fetch_dates(start_date, end_date)
 
     LOGGER.info(f"Fetching data from {fetch_from} to {fetch_until}")
+
     new_rows = extract.get_league_game_log_from_date(fetch_from.strftime('%Y-%m-%d'), fetch_until.strftime('%Y-%m-%d'))
     new_rows = _canonicalise(new_rows)
     if new_rows is None or new_rows.empty:
@@ -190,6 +184,7 @@ def daily(
 
     if GAME_CSV.exists():
         # Append new rows
+
         new_rows.to_csv(GAME_CSV, mode="a", header=False, index=False)
         appended_rows = len(new_rows)
         final_row_count = len(existing_game_df) + appended_rows

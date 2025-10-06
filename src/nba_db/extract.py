@@ -7,24 +7,54 @@ import time
 from datetime import date
 from typing import Optional, Tuple
 import json
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
 
 import pandas as pd
 import requests
-
-from requests import exceptions as requests_exceptions
+from requests import exceptions as requests_exceptions, HTTPError
 
 from .utils import get_proxies
 
 
 LOGGER = logging.getLogger(__name__)
 
-SEASON_TYPES = [
-    "Regular Season",
-    "Playoffs",
-    "PlayIn",
-    "In Season Tournament",
-]
+DAILY_SEASON_TYPES = ["Regular Season", "Playoffs", "PlayIn", "In-Season Tournament"]
+
+SEASON_TYPE_MAP = {
+    "regular season": "Regular Season",
+    "playoffs": "Playoffs",
+    "pre season": "Pre Season",
+    "preseason": "Pre Season",
+    "playin": "PlayIn",
+    "play-in": "PlayIn",
+    "in season tournament": "In-Season Tournament",
+    "in-season tournament": "In-Season Tournament",
+}
+
+def _canonical_season_type(s: str | None) -> str | None:
+    if not s:
+        return None
+    return SEASON_TYPE_MAP.get(s.strip().lower(), s)
+
+def _season_types_for_window(window_start: date, window_end: date, season_start_year: int):
+    # rough guards – cheap and effective
+    out = set(["Regular Season"])  # default assumption
+    # Pre Season Sep-Oct
+    if 9 <= window_start.month <= 10 or 9 <= window_end.month <= 10:
+        out.add("Pre Season")
+    # Play-In & Playoffs mid-Apr → Jun
+    if window_end.month >= 4:
+        out.add("PlayIn")
+        out.add("Playoffs")
+    # In-Season Tournament Nov–Dec
+    if 11 <= window_start.month <= 12 or 11 <= window_end.month <= 12:
+        out.add("In-Season Tournament")
+    return sorted(list(out))
+
+def _is_retryable_http(e: Exception) -> bool:
+    if isinstance(e, HTTPError) and e.response is not None:
+        return e.response.status_code in {429, 500, 502, 503, 504}
+    return isinstance(e, (TimeoutError, ConnectionError))
 
 NBA_API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -109,12 +139,18 @@ def get_league_game_log_from_date(
         season_from = datefrom_obj if season_year == start_year else season_start
         season_to = effective_end if season_year == effective_end_year else season_end
 
-        for season_type in SEASON_TYPES:
+        for season_type_raw in _season_types_for_window(season_from, season_to, season_year):
             formatted_from = _format_for_api(season_from if season_from >= season_start else season_start)
             formatted_to = _format_for_api(season_to if season_to <= season_end else season_end)
 
-            @retry(wait=wait_exponential(min=1, max=6), stop=stop_after_attempt(4), retry=retry_if_exception_type(requests.exceptions.RequestException))
-            def _make_api_request(season, season_type, formatted_from, formatted_to, proxy_to_use):
+            @retry(
+                wait=wait_exponential(multiplier=1, min=2, max=8),
+                stop=stop_after_attempt(4),
+                retry=retry_if_exception(_is_retryable_http),
+                reraise=True,
+            )
+            def _make_api_request(season, season_type_raw, formatted_from, formatted_to, proxy_to_use):
+                season_type = _canonical_season_type(season_type_raw) # Canonicalize season type
                 base_url = "https://stats.nba.com/stats/leaguegamelog"
                 params = {
                     "LeagueID": "00", # NBA
@@ -140,10 +176,10 @@ def get_league_game_log_from_date(
 
             try:
                 proxy_to_use = random.choice(proxies) if proxies else None
-                raw_data = _make_api_request(season, season_type, formatted_from, formatted_to, proxy_to_use)
+                raw_data = _make_api_request(season, season_type_raw, formatted_from, formatted_to, proxy_to_use)
 
                 if "resultSets" not in raw_data:
-                    LOGGER.warning(f"'resultSets' not found in API response for {season_type} from {formatted_from} to {formatted_to}. Response: {raw_data}")
+                    LOGGER.warning(f"'resultSets' not found in API response for {season_type_raw} from {formatted_from} to {formatted_to}. Response: {raw_data}")
                     continue # Continue to next season_type
 
                 # Assuming the first resultSet contains the game log data
@@ -153,20 +189,26 @@ def get_league_game_log_from_date(
                 df = pd.DataFrame(rows, columns=headers)
 
                 if df.empty:
-                    LOGGER.info(f"No data returned for {season_type} from {formatted_from} to {formatted_to}.")
+                    LOGGER.info(f"No data returned for {season_type_raw} from {formatted_from} to {formatted_to}.")
                     continue # Continue to next season_type
                 # normalize here so callers can rely on shape
                 df.columns = df.columns.str.lower()
                 if "game_date" in df.columns:
                     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-                df["season_type"] = season_type
+                df["season_type"] = _canonical_season_type(season_type_raw) # Use canonical season type
                 # DO NOT self-merge; keep per-team rows
                 frames.append(df)
+            except HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                if code == 400:
+                    LOGGER.warning(f"Skipping season_type={season_type_raw} for {season}: server says 400 (likely invalid SeasonType/date combo or label).")
+                    continue # Continue to next season type
+                raise # Re-raise other HTTP errors
             except requests.exceptions.RequestException as e:
-                LOGGER.error(f"RequestException for {season_type} from {formatted_from} to {formatted_to}: {e}")
+                LOGGER.error(f"RequestException for {season_type_raw} from {formatted_from} to {formatted_to}: {e}")
                 # Tenacity will handle retries, so we just log and let it retry or fail
             except json.JSONDecodeError as e:
-                LOGGER.error(f"JSONDecodeError for {season_type} from {formatted_from} to {formatted_to}: {e}. Response content: {response.text}")
+                LOGGER.error(f"JSONDecodeError for {season_type_raw} from {formatted_from} to {formatted_to}: {e}. Response content: {response.text}")
                 # Tenacity does not retry on JSONDecodeError by default, so we log and continue
             time.sleep(REQUEST_SLEEP_SECONDS) # Politeness sleep after each successful call
 
