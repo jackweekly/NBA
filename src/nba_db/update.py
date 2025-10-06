@@ -115,6 +115,13 @@ def _log_fetch_window(new_rows: pd.DataFrame) -> None:
     window = f"{valid_dates.min().date()} → {valid_dates.max().date()}"
     LOGGER.info("Fetched %s new rows covering %s", len(new_rows), window)
 
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        series = frame[column].astype(str).str.strip()
+        if column in NUMERIC_KEY_COLUMNS:
+            series = series.str.lstrip("0").replace({"": "0"})
+        frame[column] = series
 
 def daily(
     *,

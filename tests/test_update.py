@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import date
 
+from requests import exceptions as requests_exceptions
+
 import pandas as pd
 import pytest
+from requests import exceptions as requests_exceptions
 
 from nba_db import paths, update
 
