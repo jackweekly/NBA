@@ -31,9 +31,28 @@ HISTORICAL_START_DATE = date(1946, 11, 1)
 SEASON_TYPES: tuple[str, ...] = (
     "Regular Season",
     "Playoffs",
-    "PlayIn",
     "Pre Season",
+    "In Season Tournament",
 )
+
+NBA_API_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
+
+DEFAULT_TIMEOUT = 15
 
 
 @dataclass
@@ -161,6 +180,8 @@ def _fetch_game_logs_for_date(target_date: date, retries: int = 3, pause: float 
                     season_type_all_star=season_type,
                     date_from_nullable=date_str,
                     date_to_nullable=date_str,
+                    headers=NBA_API_HEADERS,
+                    timeout=DEFAULT_TIMEOUT,
                 )
                 frame = endpoint.get_data_frames()[0]
                 if not frame.empty:
@@ -213,6 +234,8 @@ def _fetch_game_logs_for_season(season: str, retries: int = 3, pause: float = 1.
                     league_id="00",
                     season=season,
                     season_type_all_star=season_type,
+                    headers=NBA_API_HEADERS,
+                    timeout=DEFAULT_TIMEOUT,
                 )
                 frame = endpoint.get_data_frames()[0]
                 if not frame.empty:
@@ -467,7 +490,7 @@ def update_raw_data(
 
     stop = _parse_date(end_date)
     if stop is None:
-        stop = date.today() - timedelta(days=1)
+        stop = date.today()
 
     if fetch_all_history:
         start = HISTORICAL_START_DATE
