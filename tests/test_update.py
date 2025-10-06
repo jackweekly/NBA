@@ -45,6 +45,18 @@ def test_daily_incremental_appends(monkeypatch, tmp_path):
     assert result.rows_written == len(new_frame)
 
 
+def test_next_start_date_handles_lowercase_columns(monkeypatch, tmp_path):
+    _setup_config(tmp_path, monkeypatch)
+    game_csv = tmp_path / "data/raw/game.csv"
+    game_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "game_id": ["0001"],
+        "game_date": ["2020-01-01"],
+    }).to_csv(game_csv, index=False)
+
+    assert update._next_start_date(game_csv) == date(2020, 1, 2)
+
+
 def test_daily_without_history_file_raises(monkeypatch, tmp_path):
     _setup_config(tmp_path, monkeypatch)
     with pytest.raises(FileNotFoundError):
@@ -77,6 +89,61 @@ def test_init_writes_all_resources(monkeypatch, tmp_path):
     assert (tmp_path / "data/raw/team_info_common.csv").exists()
     assert (tmp_path / "data/raw/game.csv").exists()
     assert (tmp_path / "data/raw/game_summary.csv").exists()
+
+
+def test_write_dataframe_deduplicates(monkeypatch, tmp_path):
+    _setup_config(tmp_path, monkeypatch)
+    path = tmp_path / "data/raw/game.csv"
+    frame = pd.DataFrame({
+        "GAME_ID": ["0001", "0001"],
+        "TEAM_ID": ["1610612737", "1610612737"],
+        "SEASON_TYPE": ["Regular Season", "Regular Season"],
+    })
+
+    rows = update._write_dataframe(
+        path,
+        frame,
+        append=False,
+        deduplicate_subset=update.GAME_LOG_PRIMARY_KEY,
+    )
+
+    saved = pd.read_csv(path)
+    assert rows == 1
+    assert len(saved) == 1
+    assert list(saved.columns) == [col.lower() for col in frame.columns]
+
+
+def test_write_dataframe_append_deduplicates(monkeypatch, tmp_path):
+    _setup_config(tmp_path, monkeypatch)
+    path = tmp_path / "data/raw/game.csv"
+    initial = pd.DataFrame({
+        "GAME_ID": ["0001"],
+        "TEAM_ID": ["1610612737"],
+        "SEASON_TYPE": ["Regular Season"],
+    })
+    update._write_dataframe(
+        path,
+        initial,
+        append=False,
+        deduplicate_subset=update.GAME_LOG_PRIMARY_KEY,
+    )
+
+    duplicate = pd.DataFrame({
+        "game_id": ["0001"],
+        "team_id": ["1610612737"],
+        "season_type": ["Regular Season"],
+    })
+
+    rows = update._write_dataframe(
+        path,
+        duplicate,
+        append=True,
+        deduplicate_subset=update.GAME_LOG_PRIMARY_KEY,
+    )
+
+    saved = pd.read_csv(path)
+    assert rows == 0
+    assert len(saved) == 1
 
 
 def test_get_league_game_log_from_date_bounds(monkeypatch):

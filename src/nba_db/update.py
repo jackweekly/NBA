@@ -31,6 +31,10 @@ SEASON_TYPES: tuple[str, ...] = (
 )
 
 
+GAME_LOG_PRIMARY_KEY: tuple[str, str, str] = ("game_id", "team_id", "season_type")
+NUMERIC_KEY_COLUMNS: frozenset[str] = frozenset({"game_id", "team_id"})
+
+
 NBA_API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -158,6 +162,38 @@ def _season_label(year: int) -> str:
     return f"{year}-{str(year + 1)[-2:]}"
 
 
+def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``frame`` with lower-case column names."""
+
+    if frame.empty:
+        renamed = frame.copy()
+        renamed.columns = [col.lower() for col in frame.columns]
+        return renamed
+    return frame.rename(columns=str.lower)
+
+
+def _normalise_key_columns(frame: pd.DataFrame, columns: Sequence[str]) -> None:
+    """Normalise key columns in-place for deduplication comparisons."""
+
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        series = frame[column].astype(str).str.strip()
+        if column in NUMERIC_KEY_COLUMNS:
+            series = series.str.lstrip("0").replace({"": "0"})
+        frame[column] = series
+
+
+def _deduplicate_game_log(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate rows from a canonical game log frame."""
+
+    canonical = _canonicalize_columns(frame)
+    available_subset = [column for column in GAME_LOG_PRIMARY_KEY if column in canonical.columns]
+    if not available_subset:
+        return canonical.drop_duplicates(ignore_index=True)
+    return canonical.drop_duplicates(subset=available_subset, keep="last", ignore_index=True)
+
+
 def _season_range(start: date, end: date) -> Iterable[int]:
     start_year = start.year if start.month >= 7 else start.year - 1
     end_year = end.year if end.month >= 7 else end.year - 1
@@ -193,10 +229,11 @@ def _fetch_season_frame(
         )
         if not frame.empty:
             frame.insert(0, "SEASON_TYPE", season_type)
-            frames.append(frame)
+            frames.append(_canonicalize_columns(frame))
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    return _canonicalize_columns(combined)
 
 
 def get_league_game_log_all() -> pd.DataFrame:
@@ -210,7 +247,8 @@ def get_league_game_log_all() -> pd.DataFrame:
             frames.append(season_frame)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    return _deduplicate_game_log(combined)
 
 
 def get_league_game_log_from_date(
@@ -232,13 +270,15 @@ def get_league_game_log_from_date(
             frames.append(season_frame)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    return _deduplicate_game_log(combined)
 
 
-def _infer_game_date(series: pd.Series) -> pd.Series:
-    for column in ("GAME_DATE", "GAME_DATE_EST", "GAME_DATE_TIME_EST"):
-        if column in series:
-            return pd.to_datetime(series[column], errors="coerce")
+def _infer_game_date(frame: pd.DataFrame) -> pd.Series:
+    canonical = _canonicalize_columns(frame)
+    for column in ("game_date", "game_date_est", "game_date_time_est"):
+        if column in canonical:
+            return pd.to_datetime(canonical[column], errors="coerce")
     raise KeyError("Game log does not contain a date column")
 
 
@@ -248,6 +288,7 @@ def _next_start_date(game_csv_path: Path) -> date:
             "Cannot infer start date because game.csv does not exist."
         )
     frame = pd.read_csv(game_csv_path)
+    frame = _canonicalize_columns(frame)
     if frame.empty:
         raise ValueError("Existing game.csv is empty")
     dates = _infer_game_date(frame)
@@ -257,13 +298,77 @@ def _next_start_date(game_csv_path: Path) -> date:
     return (last.date() + timedelta(days=1))
 
 
-def _write_dataframe(path: Path, frame: pd.DataFrame, *, append: bool) -> int:
+def _write_dataframe(
+    path: Path,
+    frame: pd.DataFrame,
+    *,
+    append: bool,
+    deduplicate_subset: Optional[Sequence[str]] = None,
+) -> int:
+    """Persist ``frame`` to ``path`` while optionally removing duplicates.
+
+    When ``deduplicate_subset`` is provided, both the incoming ``frame`` and any
+    existing data on disk are canonicalised to lower-case column names and
+    deduplicated using the supplied subset. The function returns the count of
+    unique rows contributed by ``frame``.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    if append and path.exists():
-        frame.to_csv(path, mode="a", header=False, index=False)
+
+    if deduplicate_subset is not None:
+        frame_to_write = _canonicalize_columns(frame)
+        subset = [column.lower() for column in deduplicate_subset]
+        available_subset_frame = [column for column in subset if column in frame_to_write.columns]
+        if available_subset_frame:
+            _normalise_key_columns(frame_to_write, available_subset_frame)
+            frame_to_write = frame_to_write.drop_duplicates(
+                subset=available_subset_frame,
+                keep="last",
+                ignore_index=True,
+            )
+        else:
+            frame_to_write = frame_to_write.drop_duplicates(ignore_index=True)
     else:
-        frame.to_csv(path, index=False)
-    return len(frame)
+        frame_to_write = frame.copy()
+        subset = []
+
+    if append and path.exists():
+        if deduplicate_subset is None:
+            frame_to_write.to_csv(path, mode="a", header=False, index=False)
+            return len(frame_to_write)
+
+        existing = pd.read_csv(path)
+        existing = _canonicalize_columns(existing)
+        shared_subset = [column for column in subset if column in existing.columns]
+        if shared_subset:
+            _normalise_key_columns(existing, shared_subset)
+            _normalise_key_columns(frame_to_write, shared_subset)
+            existing_keys = set(existing[shared_subset].itertuples(index=False, name=None))
+            incoming_keys = [
+                row
+                for row in frame_to_write[shared_subset].itertuples(index=False, name=None)
+                if row not in existing_keys
+            ]
+            appended_count = len(incoming_keys)
+        else:
+            appended_count = len(frame_to_write)
+
+        combined = pd.concat([existing, frame_to_write], ignore_index=True)
+        available_subset_combined = [column for column in subset if column in combined.columns]
+        if available_subset_combined:
+            _normalise_key_columns(combined, available_subset_combined)
+            combined = combined.drop_duplicates(
+                subset=available_subset_combined,
+                keep="last",
+                ignore_index=True,
+            )
+        else:
+            combined = combined.drop_duplicates(ignore_index=True)
+        combined.to_csv(path, index=False)
+        return appended_count
+
+    frame_to_write.to_csv(path, index=False)
+    return len(frame_to_write)
 
 
 def _call_with_retry(
@@ -370,7 +475,12 @@ def daily(
 
     if fetch_all_history:
         frame = get_league_game_log_all()
-        rows = _write_dataframe(game_csv_path, frame, append=False)
+        rows = _write_dataframe(
+            game_csv_path,
+            frame,
+            append=False,
+            deduplicate_subset=GAME_LOG_PRIMARY_KEY,
+        )
         return DailyUpdateResult(game_csv_path, rows, appended=False)
 
     start = date.fromisoformat(start_date) if start_date else _next_start_date(game_csv_path)
@@ -378,7 +488,12 @@ def daily(
     frame = get_league_game_log_from_date(start, stop)
     if frame.empty:
         return DailyUpdateResult(game_csv_path, 0, appended=game_csv_path.exists())
-    rows = _write_dataframe(game_csv_path, frame, append=game_csv_path.exists())
+    rows = _write_dataframe(
+        game_csv_path,
+        frame,
+        append=game_csv_path.exists(),
+        deduplicate_subset=GAME_LOG_PRIMARY_KEY,
+    )
     return DailyUpdateResult(game_csv_path, rows, appended=game_csv_path.exists())
 
 
@@ -400,7 +515,14 @@ def init(output_dir: Optional[Path | str] = None) -> InitResult:
     row_counts = {
         "players": _write_dataframe(player_path, players_frame, append=False) if not players_frame.empty else 0,
         "teams": _write_dataframe(team_path, teams_frame, append=False) if not teams_frame.empty else 0,
-        "games": _write_dataframe(game_path, games_frame, append=False) if not games_frame.empty else 0,
+        "games": _write_dataframe(
+            game_path,
+            games_frame,
+            append=False,
+            deduplicate_subset=GAME_LOG_PRIMARY_KEY,
+        )
+        if not games_frame.empty
+        else 0,
         "game_summaries": _write_dataframe(game_summary_path, summaries_frame, append=False) if not summaries_frame.empty else 0,
     }
 
