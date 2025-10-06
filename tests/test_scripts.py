@@ -4,6 +4,8 @@ import os
 
 import pytest
 
+from pathlib import Path
+
 from nba_db import update as nba_update
 from nbapredictor import nbadb_sync
 
@@ -75,3 +77,21 @@ def test_run_daily_update_sets_numeric_environment(monkeypatch):
 
     for key, value in run_daily_update._NUMERIC_ENV_DEFAULTS.items():
         assert os.environ[key] == value
+
+
+def test_update_init_delegates_to_bootstrap(monkeypatch):
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_bootstrap(path: Path, *, force: bool = False):
+        captured["path"] = path
+        captured["force"] = force
+        return sentinel
+
+    monkeypatch.setattr(nbadb_sync, "bootstrap_from_kaggle", fake_bootstrap)
+
+    result = nba_update.init(output_dir="/tmp/bootstrap", force=True)
+
+    assert captured["path"] == Path("/tmp/bootstrap")
+    assert captured["force"] is True
+    assert result is sentinel

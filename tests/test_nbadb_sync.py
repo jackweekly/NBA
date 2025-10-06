@@ -102,3 +102,43 @@ def test_update_raw_data_fetch_all_history(tmp_path, monkeypatch):
 
     for file_path in summary.downloaded_files:
         assert file_path.exists()
+
+
+def test_bootstrap_kaggle_imports_dataset(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "external" / "wyatt"
+    dataset_root.mkdir(parents=True)
+
+    pd.DataFrame(
+        {
+            "GAME_ID": ["0001", "0002", "0003"],
+            "GAME_DATE": ["2023-10-05", "2024-06-12", "2024-10-26"],
+            "TEAM_ID": ["A", "B", "C"],
+        }
+    ).to_csv(dataset_root / "game.csv", index=False)
+
+    monkeypatch.setattr(nbadb_sync, "bootstrap_kaggle_dump", lambda destination: dataset_root)
+    monkeypatch.setattr(
+        nbadb_sync,
+        "fetch_dataset_metadata",
+        lambda session=None: {"title": "NBA Database"},
+    )
+
+    raw_dir = tmp_path / "raw"
+    summary = nbadb_sync.update_raw_data(
+        output_dir=raw_dir,
+        bootstrap_kaggle=True,
+        end_date="2024-10-26",
+    )
+
+    expected_files = {
+        raw_dir / "leaguegamelog" / "season=2023-24" / "part-000.csv",
+        raw_dir / "leaguegamelog" / "season=2024-25" / "part-000.csv",
+    }
+    assert expected_files.issubset(set(summary.downloaded_files))
+    assert summary.processed_dates == []
+    assert set(summary.processed_seasons) <= {"2023-24", "2024-25"}
+
+    manifest = json.loads((raw_dir / "manifest.json").read_text())
+    assert manifest["last_updated"] == "2024-10-26"
+    assert set(manifest["historical_seasons"]) >= {"2023-24", "2024-25"}
+    assert manifest["bootstrap"]["dataset"] == nbadb_sync.KAGGLE_DATASET_ID

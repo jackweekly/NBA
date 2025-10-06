@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -58,6 +58,17 @@ class UpdateSummary:
             "skipped_seasons": list(self.skipped_seasons),
             "empty_seasons": list(self.empty_seasons),
         }
+
+
+@dataclass
+class KaggleBootstrapResult:
+    """Details about the outcome of a Kaggle bootstrap."""
+
+    dataset_dir: Path
+    downloaded_files: List[Path]
+    processed_seasons: List[str]
+    skipped_seasons: List[str]
+    last_game_date: Optional[date]
 
 
 def fetch_dataset_metadata(session: Optional[requests.Session] = None) -> Dict[str, object]:
@@ -241,14 +252,17 @@ def _date_range(start: date, end: date) -> Iterable[date]:
         current += timedelta(days=1)
 
 
-def bootstrap_kaggle_dump(output_dir: Path) -> None:
+def bootstrap_kaggle_dump(destination: Path) -> Path:
     """Download the Kaggle dataset backing the ``nbadb`` project.
 
-    The Kaggle CLI must be installed and authenticated. The dataset is unpacked
-    into ``output_dir / 'nbadb'``.
+    Args:
+        destination: Directory where the Kaggle dataset should be extracted.
+
+    Returns:
+        The directory containing the downloaded dataset.
     """
 
-    destination = output_dir / "nbadb"
+    destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     if shutil.which("kaggle") is None:
         raise FileNotFoundError(
@@ -267,6 +281,143 @@ def bootstrap_kaggle_dump(output_dir: Path) -> None:
             KAGGLE_DATASET_ID,
         ],
         check=True,
+    )
+    return destination
+
+
+def _bootstrap_from_kaggle(
+    output_dir: Path, *, force: bool = False, dataset_dir: Optional[Path] = None
+) -> KaggleBootstrapResult:
+    """Download and ingest the upstream Kaggle dump into ``output_dir``."""
+
+    if pd is None:  # pragma: no cover - dependency is optional in unit tests
+        raise ModuleNotFoundError("pandas is required to bootstrap the Kaggle dump")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    staging_root = (
+        Path(dataset_dir)
+        if dataset_dir is not None
+        else output_dir.parent / "external" / "wyatt"
+    )
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    dataset_location = bootstrap_kaggle_dump(staging_root)
+
+    manifest = _load_manifest(output_dir)
+
+    game_candidates = sorted(dataset_location.rglob("game.csv"))
+    if not game_candidates:
+        raise FileNotFoundError(
+            "Unable to locate 'game.csv' inside the Kaggle dataset."
+        )
+
+    LOGGER.info("Loading Kaggle league game log from %s", game_candidates[0])
+    game_frame = pd.read_csv(game_candidates[0])
+    if game_frame.empty:
+        LOGGER.warning("The Kaggle league game log is empty; nothing to import")
+        manifest.setdefault("historical_seasons", [])
+        manifest["bootstrap"] = {
+            "source": "kaggle",
+            "dataset": KAGGLE_DATASET_ID,
+            "dataset_dir": str(dataset_location),
+            "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "rows": 0,
+        }
+        _write_manifest(output_dir, manifest)
+        return KaggleBootstrapResult(
+            dataset_dir=dataset_location,
+            downloaded_files=[],
+            processed_seasons=[],
+            skipped_seasons=[],
+            last_game_date=None,
+        )
+
+    date_column: Optional[str] = None
+    for candidate in ("GAME_DATE", "GAME_DATE_EST", "GAME_DATE_TIME_EST"):
+        if candidate in game_frame.columns:
+            date_column = candidate
+            break
+    if date_column is None:
+        raise KeyError(
+            "The Kaggle game log is missing a GAME_DATE column; cannot infer seasons."
+        )
+
+    game_dates = pd.to_datetime(game_frame[date_column], errors="coerce")
+    if hasattr(game_dates.dt, "tz") and game_dates.dt.tz is not None:
+        game_dates = game_dates.dt.tz_convert(None)
+    if hasattr(game_dates.dt, "tz_localize"):
+        try:
+            game_dates = game_dates.dt.tz_localize(None)
+        except TypeError:
+            # pandas < 2.2 raises TypeError when localising timezone-aware series
+            pass
+    game_frame = game_frame.assign(_INGEST_GAME_DATE=game_dates.dt.date)
+    game_frame = game_frame[game_frame["_INGEST_GAME_DATE"].notna()].copy()
+    if game_frame.empty:
+        raise ValueError("Kaggle game log does not contain valid GAME_DATE values")
+
+    game_frame["_INGEST_SEASON"] = [
+        _season_for_date(game_date) for game_date in game_frame["_INGEST_GAME_DATE"]
+    ]
+
+    downloaded: List[Path] = []
+    processed_seasons: List[str] = []
+    skipped_seasons: List[str] = []
+
+    seasons_in_dataset = sorted(game_frame["_INGEST_SEASON"].unique())
+    for season_label in seasons_in_dataset:
+        season_frame = game_frame[game_frame["_INGEST_SEASON"] == season_label].drop(
+            columns=["_INGEST_GAME_DATE", "_INGEST_SEASON"]
+        )
+        season_dir = output_dir / "leaguegamelog" / f"season={season_label}"
+        destination = season_dir / "part-000.csv"
+        if destination.exists() and not force:
+            LOGGER.debug(
+                "Skipping Kaggle import for season %s; destination exists", season_label
+            )
+            skipped_seasons.append(season_label)
+            continue
+        season_dir.mkdir(parents=True, exist_ok=True)
+        season_frame.to_csv(destination, index=False)
+        downloaded.append(destination)
+        processed_seasons.append(season_label)
+
+    last_game_date = max(game_frame["_INGEST_GAME_DATE"])
+
+    historical_seasons = set(manifest.get("historical_seasons", []))
+    historical_seasons.update(seasons_in_dataset)
+    manifest["historical_seasons"] = sorted(historical_seasons)
+    manifest["last_updated"] = last_game_date.strftime(DATE_FORMAT)
+    manifest["bootstrap"] = {
+        "source": "kaggle",
+        "dataset": KAGGLE_DATASET_ID,
+        "dataset_dir": str(dataset_location),
+        "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rows": int(len(game_frame)),
+    }
+    _write_manifest(output_dir, manifest)
+
+    return KaggleBootstrapResult(
+        dataset_dir=dataset_location,
+        downloaded_files=downloaded,
+        processed_seasons=processed_seasons,
+        skipped_seasons=skipped_seasons,
+        last_game_date=last_game_date,
+    )
+
+
+def bootstrap_from_kaggle(
+    output_dir: Path | str = Path("data/raw"),
+    *,
+    force: bool = False,
+    dataset_dir: Optional[Path] = None,
+) -> KaggleBootstrapResult:
+    """Public wrapper around :func:`_bootstrap_from_kaggle`."""
+
+    return _bootstrap_from_kaggle(
+        Path(output_dir), force=force, dataset_dir=dataset_dir
     )
 
 
@@ -298,10 +449,19 @@ def update_raw_data(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if bootstrap_kaggle:
-        bootstrap_kaggle_dump(output_dir)
+    downloaded: List[Path] = []
+    processed_seasons: List[str] = []
+    skipped_seasons: List[str] = []
+    empty_seasons: List[str] = []
 
-    manifest = _load_manifest(output_dir)
+    if bootstrap_kaggle:
+        bootstrap_result = _bootstrap_from_kaggle(output_dir, force=force)
+        downloaded.extend(bootstrap_result.downloaded_files)
+        processed_seasons.extend(bootstrap_result.processed_seasons)
+        skipped_seasons.extend(bootstrap_result.skipped_seasons)
+        manifest = _load_manifest(output_dir)
+    else:
+        manifest = _load_manifest(output_dir)
     metadata = fetch_dataset_metadata(session=session)
     LOGGER.info("Fetched upstream metadata: %s", metadata.get("title", "unknown"))
 
@@ -320,14 +480,17 @@ def update_raw_data(
 
     if start > stop:
         LOGGER.info("No updates required: start=%s stop=%s", start, stop)
-        return UpdateSummary([], [], [], [])
+        return UpdateSummary(
+            [],
+            downloaded,
+            [],
+            [],
+            processed_seasons=processed_seasons,
+            skipped_seasons=skipped_seasons,
+            empty_seasons=empty_seasons,
+        )
 
     if fetch_all_history:
-        processed_seasons: List[str] = []
-        skipped_seasons: List[str] = []
-        empty_seasons: List[str] = []
-        downloaded: List[Path] = []
-
         for season_year, season_label in _historical_season_range(start, stop):
             season_dir = output_dir / "leaguegamelog" / f"season={season_label}"
             destination = season_dir / "part-000.csv"
@@ -371,7 +534,6 @@ def update_raw_data(
         )
 
     processed: List[date] = []
-    downloaded: List[Path] = []
     skipped: List[date] = []
     empty: List[date] = []
 
@@ -396,12 +558,22 @@ def update_raw_data(
         manifest["last_updated"] = target_date.strftime(DATE_FORMAT)
         _write_manifest(output_dir, manifest)
 
-    return UpdateSummary(processed, downloaded, skipped, empty)
+    return UpdateSummary(
+        processed,
+        downloaded,
+        skipped,
+        empty,
+        processed_seasons=processed_seasons,
+        skipped_seasons=skipped_seasons,
+        empty_seasons=empty_seasons,
+    )
 
 
 __all__ = [
     "UpdateSummary",
+    "KaggleBootstrapResult",
     "bootstrap_kaggle_dump",
+    "bootstrap_from_kaggle",
     "fetch_dataset_metadata",
     "update_raw_data",
 ]

@@ -48,12 +48,14 @@ def daily(
     return DailyUpdateResult(summary=summary)
 
 
-def init(output_dir: Path | str = Path("data/raw")) -> None:
+def init(
+    output_dir: Path | str = Path("data/raw"), *, force: bool = False
+) -> nbadb_sync.KaggleBootstrapResult:
     """Run the one-off bootstrap stage by pulling the Kaggle dump."""
 
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    nbadb_sync.bootstrap_kaggle_dump(destination)
+    return nbadb_sync.bootstrap_from_kaggle(destination, force=force)
 
 
 __all__ = ["DailyUpdateResult", "daily", "init"]
