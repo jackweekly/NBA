@@ -106,7 +106,10 @@ def test_call_with_retry_retries_then_succeeds(monkeypatch):
     def fake_sleep(seconds: int) -> None:
         sleeps.append(seconds)
 
-    def flaky_call():
+    timeouts_seen: list[int | float] = []
+
+    def flaky_call(timeout):
+        timeouts_seen.append(timeout)
         nonlocal attempts
         attempts += 1
         if attempts < 3:
@@ -119,6 +122,7 @@ def test_call_with_retry_retries_then_succeeds(monkeypatch):
 
     assert attempts == 3
     assert sleeps == [1, 2]
+    assert timeouts_seen == [update.DEFAULT_TIMEOUT, update.DEFAULT_TIMEOUT, update.DEFAULT_TIMEOUT]
     assert not frame.empty
 
 
@@ -129,7 +133,7 @@ def test_call_with_retry_exhausts_attempts(monkeypatch):
     def fake_sleep(seconds: int) -> None:
         sleeps.append(seconds)
 
-    def failing_call():
+    def failing_call(timeout):
         nonlocal attempts
         attempts += 1
         raise requests_exceptions.Timeout("timeout", request=None)
@@ -142,3 +146,27 @@ def test_call_with_retry_exhausts_attempts(monkeypatch):
     assert "Failed to fetch player" in str(excinfo.value)
     assert attempts == update.MAX_REQUEST_RETRIES
     assert sleeps == [1, 2, 4, 8]
+
+
+def test_call_with_retry_respects_timeout_plan(monkeypatch):
+    attempts = 0
+    seen_timeouts: list[int | float] = []
+
+    def fake_sleep(seconds: int) -> None:
+        pass
+
+    def failing_call(timeout):
+        nonlocal attempts
+        attempts += 1
+        seen_timeouts.append(timeout)
+        raise requests_exceptions.ConnectTimeout("timeout", request=None)
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    custom_timeouts = (1, 2, 4)
+
+    with pytest.raises(RuntimeError):
+        update._call_with_retry("custom", failing_call, timeouts=custom_timeouts)
+
+    assert attempts == update.MAX_REQUEST_RETRIES
+    assert seen_timeouts == [1, 2, 4, 4, 4]
