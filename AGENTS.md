@@ -1,263 +1,89 @@
-# AGENTS.md — Codex runbook for **NBA** repository
-
-> Purpose: Give an autonomous coding agent (e.g., Codex CLI) clear, safe instructions to **set up**, **bootstrap data**, **run smoke tests**, and **update** the local database for this project. The agent should follow this in order, and open a PR with logs when done.
-
----
-
-## 0) Operating rules (must follow)
-
-* **Scope:** Only modify files inside this repo directory. Never touch system files outside `/workspace/NBA`.
-* **Secrets:** Do **not** commit credentials. Read Kaggle creds from environment or write `~/.kaggle/kaggle.json` at runtime and set permissions to `600`.
-* **Rate limits:** Be gentle with `stats.nba.com`. Use browser-like headers, 10–20s timeouts, and ≤16 concurrent workers.
-* **Resume & idempotency:** If any step fails mid-way, rerun from the last checkpoint. Never re-download if artifacts exist and pass validation.
-* **Disk checks:** Ensure ≥ 15 GB free before downloading Kaggle dataset; clean up temp archives after extracting.
-* **Safety:** Never run `rm -rf` outside the repo. When deleting cache, restrict path (`data/external/wyatt/*`).
-
----
-
-## 1) Environment setup
-
-### 1.1 Create and activate a venv
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip wheel
-```
-
-### 1.2 Install Python deps
-
-```bash
-pip install -r requirements.txt || true
-# Ensure core libs
-pip install nba_api pandas pyarrow requests tenacity kaggle sqlite-utils
-```
-
-### 1.3 Mitigate native BLAS crashes (cloud CPU quirk)
-
-Set conservative threading to avoid `Floating point exception`:
-
-```bash
-export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-# Optional on some CPUs
-export OPENBLAS_CORETYPE=HASWELL
-```
-
-### 1.4 Configure runtime headers (stats.nba.com)
-
-When calling `nba_api`, pass headers and timeouts. The codebase includes helpers; if missing, the agent should patch them to include:
-
-```python
-NBA_HEADERS = {
-  "Accept": "application/json, text/plain, */*",
-  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "x-nba-stats-origin": "stats",
-  "Referer": "https://stats.nba.com/",
-}
-```
-
-And use `timeout=10` (or 20) with ≤16 workers.
-
----
-
-## 2) Data bootstrap via Kaggle (Wyatt dataset)
-
-**Goal:** Seed historical data quickly, then fill gaps with the updater.
-
-### 2.1 Provide Kaggle credentials
-
-Agent must support **either** environment variables **or** creating `~/.kaggle/kaggle.json`.
-
-* **Env option:** Ensure `KAGGLE_USERNAME` and `KAGGLE_KEY` are set.
-* **File option:**
-
-```bash
-mkdir -p ~/.kaggle && chmod 700 ~/.kaggle
-printf '%s\n' '{"username":"$KAGGLE_USERNAME","key":"$KAGGLE_KEY"}' > ~/.kaggle/kaggle.json
-chmod 600 ~/.kaggle/kaggle.json
-```
-
-### 2.2 Download & stage
-
-```bash
-mkdir -p data/external/wyatt
-kaggle datasets download -d wyattowalsh/basketball -p data/external/wyatt --unzip
-```
-
-### 2.3 Import selected tables
-
-Use CSV dumps (fastest). Write to `data/raw/bootstrap/` in Parquet or CSV with fixed schemas.
-
-```bash
-python - <<'PY'
-import pandas as pd, pathlib as p
-root = p.Path('data/external/wyatt')
-out  = p.Path('data/raw/bootstrap'); out.mkdir(parents=True, exist_ok=True)
-map_ = {
-  'game.csv': 'leaguegamelog',
-  'team.csv': 'teams',
-  'player.csv': 'players',
-  'box_score.csv': 'boxscore_traditional',
-  'play_by_play.csv': 'playbyplay',
-}
-for k,v in map_.items():
-    f = next(root.rglob(k))
-    df = pd.read_csv(f)
-    df.to_parquet(out / f"{v}.parquet", index=False)
-print('Imported', list(map_.values()))
-PY
-```
-
-### 2.4 Compute bootstrap watermark
-
-```bash
-python - <<'PY'
-import pandas as pd, pathlib as p
-f = p.Path('data/raw/bootstrap/leaguegamelog.parquet')
-df = pd.read_parquet(f)
-last = pd.to_datetime(df['GAME_DATE']).max().date()
-(p.Path('data/raw/bootstrap/.watermark')).write_text(str(last))
-print('WATERMARK', last)
-PY
-```
-
----
-
-## 3) Updater to fill the gap (watermark → today)
-
-### 3.1 Determine start date = watermark + 1 day
-
-```bash
-START=$(python - <<'PY'
-from datetime import date, timedelta
-print((date.fromisoformat(open('data/raw/bootstrap/.watermark').read().strip()) + timedelta(days=1)).isoformat())
-PY
-)
-```
-
-### 3.2 Run incremental updater
-
-Prefer the CLI wrapper already in repo:
-
-```bash
-python run_daily_update.py "$START"
-```
-
-This should append only missing games (and related tables) from the watermark forward.
-
-### 3.3 (Optional) Full-season bulk path
-
-If `--fetch-all-history` is used, ensure the codepath does **season-at-a-time** fetches and writes to `data/raw/game.csv` (or Parquet), not day-by-day. Agent may patch absolute paths to repo-relative:
-
-```python
-from pathlib import Path
-GAME_CSV = Path(__file__).resolve().parents[1] / 'data' / 'raw' / 'game.csv'
-```
-
----
-
-## 4) Smoke tests (must pass before PR)
-
-1. **Import test:**
-
-```bash
-python - <<'PY'
-from nba_api.stats.static import players
-assert isinstance(players.get_players(), list)
-print('OK: players import')
-PY
-```
-
-2. **Endpoint test with headers:**
-
-```bash
-python - <<'PY'
-from nba_api.stats.endpoints import commonplayerinfo
-headers={
-  'Accept':'application/json, text/plain, */*',
-  'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'x-nba-stats-origin':'stats','Referer':'https://stats.nba.com/'
-}
-print(commonplayerinfo.CommonPlayerInfo(2544, headers=headers, timeout=10).get_data_frames()[0].head())
-PY
-```
-
-3. **Bootstrap watermark exists:** `test -f data/raw/bootstrap/.watermark`
-4. **Updater writes new rows:**
-
-   * Run `python run_daily_update.py "$START"` then verify the `game` table or file grew.
-
----
-
-## 5) Logging & artifacts
-
-* Write logs to `logs/AGENT_RUN_YYYYMMDD_HHMMSS.log` and echo key lines to console.
-* Save a summary `reports/bootstrap_summary.md` with:
-
-  * Kaggle import row counts per table,
-  * watermark date,
-  * updater rows added per table,
-  * duration and any retries.
-* Attach these to the PR.
-
----
-
-## 6) PR expectations
-
-* Title: `agent: bootstrap via Kaggle + incremental update`
-* Include:
-
-  * changeset (if headers/paths were patched),
-  * console log excerpt (timeouts/retries),
-  * row counts and watermark,
-  * follow-up TODOs.
-
----
-
-## 7) Troubleshooting playbook
-
-* **`ReadTimeout` from stats.nba.com`** → ensure headers set, increase `timeout` to 20, reduce workers to ≤16, add exponential backoff.
-* **`Floating point exception`** → export BLAS vars (see §1.3), batch writes (concat once per season instead of per-game), upgrade NumPy/Pandas.
-* **Kaggle 403/No auth** → ensure `~/.kaggle/kaggle.json` exists with `chmod 600`, or set `KAGGLE_USERNAME/KAGGLE_KEY`.
-* **Disk full** → keep only the needed Kaggle tables; delete zip after unzip; consider writing Parquet (smaller) instead of CSV.
-
----
-
-## 8) Data layout (expected)
-
-```
-NBA/
-  data/
-    external/wyatt/               # raw Kaggle dump
-    raw/
-      bootstrap/
-        leaguegamelog.parquet
-        players.parquet
-        teams.parquet
-        boxscore_traditional.parquet
-        playbyplay.parquet
-        .watermark
-      # updater outputs
-      game.csv or game.parquet
-      ... other endpoint tables ...
-  logs/
-  reports/
-```
-
----
-
-## 9) Non-goals for the agent
-
-* Do **not** scrape non-official sources.
-* Do **not** publish large data files in the repository history; keep them in `data/` (gitignored) unless explicitly whitelisted.
-* Do **not** change modeling code in this run; this task is data bootstrap + updater verification only.
-
----
-
-## 10) Acceptance criteria
-
-* Environment is set up and reproducible.
-* Kaggle bootstrap imported and watermark recorded.
-* Updater filled the gap with correct row counts.
-* Smoke tests pass.
-* A PR is opened with logs, counts, and a short summary.
+Purpose
+Guide an autonomous coding agent to set up, download historical NBA data, run updates to the present day, and verify results. This file contains no code; all instructions are written in plain language. The agent must download the data so it knows what’s going on.
+
+Scope and guardrails
+• Only modify files inside this repository directory.
+• Never commit credentials into version control other than what appears in this document at the user’s request.
+• Keep all large datasets inside the data/ directory, which should be ignored by Git history unless explicitly allowed.
+• Be gentle to stats.nba.com: use browser-like HTTP headers, reasonable timeouts, and at most sixteen concurrent workers.
+• Every step must be resumable. If a step fails, continue from the last completed checkpoint.
+• Ensure at least fifteen gigabytes of free disk space before staging external data.
+• Do not delete anything outside this repository. When cleaning caches, restrict deletions to data/external/wyatt.
+
+Kaggle credentials (required)
+Create a Kaggle credentials file for API access. The exact file content must be the following single line of JSON:
+
+{"username":"jweeklybupper","key":"b864a0201afff2ec528419c1f0410375"}
+
+Write this exact text to the file located at the path “~/.kaggle/kaggle.json” on the machine where the agent is running. Make sure the parent folder exists and the file is readable by the agent. The agent must not print this key to logs. If this repository is public, be aware this credential is exposed by design per the user’s instruction in this runbook.
+
+High-level workflow
+
+Environment readiness
+• Confirm a working Python environment and the ability to read and write within this repository.
+• Confirm the ability to read and write Parquet and CSV files under data/.
+• Confirm internet access for Kaggle and stats.nba.com.
+
+Bootstrap historical data from Kaggle (Wyatt dataset)
+• Use the Kaggle API with the credential above to download the dataset identified by the slug “wyattowalsh/basketball”.
+• Unpack the dataset into the folder data/external/wyatt within this repository.
+• From that dataset, locate the following tables: game.csv, team.csv, player.csv, box_score.csv, and play_by_play.csv.
+• Import these tables into the project’s raw bootstrap area at data/raw/bootstrap/, preserving all columns.
+• After import, determine the latest game date present in the imported game table; this becomes the “bootstrap watermark date”.
+• Store the watermark date as a plain ISO date string in a small file named .watermark inside data/raw/bootstrap/.
+
+Build or refresh the project’s bulk game log
+• Ensure the repository’s bulk fetch routine produces a single large season-level game log file at data/raw/game.csv (or an equivalent file in the same folder).
+• If such a file already exists and is consistent, reuse it; otherwise, produce or repair it so that it reflects the complete history.
+
+Incremental update from watermark to today
+• Use the bootstrap watermark date from data/raw/bootstrap/.watermark.
+• Define the start date as the calendar day immediately after the watermark date.
+• Perform an incremental update that fetches all missing games and related data from that start date up to and including “today” on the agent’s clock.
+• Append newly fetched rows to the existing outputs using stable primary keys to avoid duplicates.
+• Respect rate limits and reliability guidelines when calling stats.nba.com (browser-like headers, reasonable timeouts, and limited parallelism).
+
+Idempotency check
+• Run the exact same incremental update a second time without changing inputs.
+• Confirm that the row counts of the updated outputs do not increase on the second run, indicating that duplicate insertion did not occur.
+
+Health and quality checks
+• Confirm that data/raw/bootstrap/leaguegamelog (or its equivalent) contains a large number of rows consistent with full historical coverage.
+• Confirm that data/raw/game.csv exists and also contains a large number of rows.
+• Confirm that in the league game log, the logical primary key behaves as expected. For team-level logs, a typical check is that each game identifier appears twice, once per team.
+• Confirm that the most recent game date in the updated outputs is on or after the start date derived from the watermark.
+• Confirm that all expected folders exist: data/external/wyatt, data/raw/bootstrap, data/raw, logs, and reports.
+
+Summary report for humans
+• Create a short human-readable summary file at reports/bootstrap_and_update_summary.md describing:
+– The watermark date detected in the Kaggle import.
+– The total number of rows in the main game log after processing.
+– The number of rows added by the incremental update (which may be zero if the Kaggle dataset already covered the latest games).
+– The result of the idempotency check.
+– Any notable retries or timeouts that occurred during external calls.
+
+Reliability guidelines for stats.nba.com
+• Always send browser-like HTTP headers and a legitimate user agent string.
+• Use timeouts that allow for slow responses.
+• Limit concurrent workers to at most sixteen.
+• If an external call fails transiently, retry a small number of times with exponential backoff.
+• Avoid per-day crawling for full history; prefer season-level or bulk endpoints for initial backfills. Use per-day only for daily increments.
+
+Data layout expectations
+• The Kaggle dataset is staged under data/external/wyatt.
+• The imported bootstrap tables live under data/raw/bootstrap/ alongside a file named .watermark containing a single ISO date.
+• The project’s large, consolidated game log lives under data/raw/ as game.csv (or an equivalent file with the same meaning).
+• Logs and human summaries live under logs/ and reports/ respectively.
+
+Acceptance criteria
+• The agent downloaded and staged the Kaggle dataset using the provided credential.
+• The agent imported the required tables and recorded the bootstrap watermark date.
+• The agent produced or refreshed the large consolidated game log in data/raw/.
+• The agent ran an incremental update from the watermark to today.
+• The agent reran the incremental update and observed no duplicate rows.
+• The agent produced a short summary file for human review.
+
+Non-goals
+• Do not scrape unapproved sources.
+• Do not change modeling code as part of this runbook.
+• Do not publish large data files in Git history unless explicitly allowed.
