@@ -219,3 +219,96 @@ def get_league_game_log_from_date(
 
 
 __all__ = ["get_league_game_log_from_date", "SEASON_TYPES"]
+
+
+BOX_SCORE_URL = "https://stats.nba.com/stats/boxscoretraditionalv2"
+PLAY_BY_PLAY_URL = "https://stats.nba.com/stats/playbyplayv2"
+PER_GAME_SLEEP_SECONDS = 0.35
+
+
+def _fetch_json(endpoint: str, params: dict[str, object], *, timeout: int, proxy: str | None) -> dict:
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    response = requests.get(
+        endpoint,
+        params=params,
+        headers=NBA_API_HEADERS,
+        timeout=timeout,
+        proxies=proxies,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _frame_from_result(payload: dict, name: str) -> pd.DataFrame:
+    result_sets = payload.get("resultSets") or payload.get("resultSet")
+    if isinstance(result_sets, dict):
+        target = result_sets if result_sets.get("name") == name else {}
+    elif isinstance(result_sets, list):
+        target = next((item for item in result_sets if item.get("name") == name), {})
+    else:
+        target = {}
+    headers = target.get("headers", [])
+    rows = target.get("rowSet", [])
+    if not headers or not rows:
+        return pd.DataFrame(columns=headers)
+    frame = pd.DataFrame(rows, columns=headers)
+    frame.columns = frame.columns.str.lower()
+    return frame
+
+
+def get_box_score(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return team and player box score frames for ``game_id``."""
+
+    proxies = get_proxies()
+
+    def _fetch():
+        proxy = random.choice(proxies) if proxies else None
+        payload = _fetch_json(
+            BOX_SCORE_URL,
+            {
+                "GameID": game_id,
+                "StartPeriod": 1,
+                "EndPeriod": 10,
+                "StartRange": 0,
+                "EndRange": 0,
+                "RangeType": 0,
+            },
+            timeout=timeout,
+            proxy=proxy,
+        )
+        return payload
+
+    payload = _call_with_retry(f"boxscoretraditionalv2 {game_id}", _fetch)
+    player = _frame_from_result(payload, "PlayerStats")
+    team = _frame_from_result(payload, "TeamStats")
+    if not player.empty:
+        player["game_id"] = str(game_id)
+    if not team.empty:
+        team["game_id"] = str(game_id)
+    return team, player
+
+
+def get_play_by_play(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
+    """Return play-by-play events for ``game_id``."""
+
+    proxies = get_proxies()
+
+    def _fetch():
+        proxy = random.choice(proxies) if proxies else None
+        payload = _fetch_json(
+            PLAY_BY_PLAY_URL,
+            {
+                "GameID": game_id,
+                "StartPeriod": 1,
+                "EndPeriod": 10,
+            },
+            timeout=timeout,
+            proxy=proxy,
+        )
+        return payload
+
+    payload = _call_with_retry(f"playbyplayv2 {game_id}", _fetch)
+    frame = _frame_from_result(payload, "PlayByPlay")
+    if not frame.empty:
+        frame["game_id"] = str(game_id)
+    return frame

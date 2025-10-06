@@ -16,17 +16,14 @@ from .paths import (
 
 LOGGER = logging.getLogger(__name__)
 
-_SQLITE_TABLES: tuple[str, ...] = (
-    "Game",
-    "Team",
-    "Player",
-    "box_score",
-    "Box_Score",
-    "line_score",
-    "Line_Score",
-    "play_by_play",
-    "Play_By_Play",
-)
+SQLITE_TABLE_MAP: dict[str, str] = {
+    "game": "bronze_game",
+    "team": "bronze_team",
+    "player": "bronze_player",
+    "line_score": "bronze_box_score_team",
+    "box_score": "bronze_box_score_team",
+    "play_by_play": "bronze_play_by_play",
+}
 
 
 def _coalesce_sqlite_tables(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
@@ -40,14 +37,15 @@ def _coalesce_sqlite_tables(connection: duckdb.DuckDBPyConnection) -> dict[str, 
           AND schema_name = 'main'
         """
     ).fetchall()
-    existing = {name for (name,) in rows}
+    existing = {name.lower(): name for (name,) in rows}
 
     mapping: dict[str, str] = {}
-    for candidate in _SQLITE_TABLES:
-        if candidate in existing:
-            mapping[f"bronze_{candidate.lower()}"] = f"SELECT * FROM seed.main.{candidate}"
-        elif candidate.lower() in existing:
-            mapping[f"bronze_{candidate.lower()}"] = f"SELECT * FROM seed.main.{candidate.lower()}"
+    for source_lower, target in SQLITE_TABLE_MAP.items():
+        if target in mapping:
+            continue
+        source_name = existing.get(source_lower)
+        if source_name:
+            mapping[target] = f"SELECT * FROM seed.main.{source_name}"
     return mapping
 
 
@@ -118,9 +116,13 @@ def seed_duckdb(
     tables = {name for (name,) in con.execute(
         "SELECT table_name FROM duckdb_tables() WHERE database_name IS NULL AND schema_name = 'main'"
     ).fetchall()}
-    if 'bronze_game_log_team' not in tables and 'bronze_game' in tables:
-        LOGGER.info('Creating bronze_game_log_team from bronze_game')
-        con.execute('CREATE OR REPLACE TABLE bronze_game_log_team AS SELECT * FROM bronze_game')
+
+    if 'bronze_game_log_team' not in tables:
+        if 'bronze_game' in tables:
+            LOGGER.info('Creating bronze_game_log_team from bronze_game')
+            con.execute('CREATE OR REPLACE TABLE bronze_game_log_team AS SELECT * FROM bronze_game')
+        else:
+            con.execute('CREATE TABLE IF NOT EXISTS bronze_game_log_team (game_id VARCHAR, team_id VARCHAR)')
 
     con.close()
     LOGGER.info("Seeded DuckDB at %s", database)
