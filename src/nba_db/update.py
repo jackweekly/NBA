@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +40,40 @@ def _atomic_write_csv(df: pd.DataFrame, out_path: Path | str):
         os.fsync(tmp.fileno())
         tmp_name = tmp.name
     os.replace(tmp_name, out_path)
+
+def _get_last_updated_date() -> date:
+    if GAME_CSV.exists():
+        existing_game_df = pd.read_csv(GAME_CSV)
+        existing_game_df = _canonicalise(existing_game_df)
+        if not existing_game_df.empty and "game_date" in existing_game_df.columns:
+            return existing_game_df["game_date"].max().date()
+    return date(2023, 1, 1) # Default to a reasonable date if no data or game_date column
+
+def _get_fetch_dates(start_date_str: Optional[str], end_date_str: Optional[str]) -> Tuple[date, date]:
+    """
+    Determines the effective start and end dates for data fetching.
+
+    Args:
+        start_date_str (str, optional): User-provided start date string.
+        end_date_str (str, optional): User-provided end date string.
+
+    Returns:
+        Tuple[date, date]: A tuple containing the effective start and end date objects.
+    """
+    last_updated_date = _get_last_updated_date()
+
+    if start_date_str:
+        fetch_from = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+    else:
+        fetch_from = last_updated_date + timedelta(days=1)
+
+    if end_date_str:
+        fetch_until = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+    else:
+        fetch_until = date.today()
+
+    return fetch_from, fetch_until
+
 
 def _log_fetch_window(df: pd.DataFrame):
     df = _canonicalise(df)
@@ -110,26 +144,7 @@ def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def _log_fetch_window(new_rows: pd.DataFrame) -> None:
-    if "game_date" not in new_rows.columns:
-        LOGGER.info("Fetched %s new rows (game_date column missing)", len(new_rows))
-        return
 
-    valid_dates = new_rows["game_date"].dropna()
-    if valid_dates.empty:
-        LOGGER.info("Fetched %s new rows with unknown game_date values", len(new_rows))
-        return
-
-    window = f"{valid_dates.min().date()} → {valid_dates.max().date()}"
-    LOGGER.info("Fetched %s new rows covering %s", len(new_rows), window)
-
-    for column in ("season_id", "game_id", "team_id"):
-        if column not in canonical.columns:
-            continue
-        series = canonical[column].astype(str).str.strip()
-        if column in {"game_id", "team_id"}:
-            series = series.str.lstrip("0").replace({"": "0"})
-        canonical[column] = series
 
 def daily(
     *,
@@ -138,35 +153,18 @@ def daily(
 ) -> DailyUpdateResult:
     """Fetch and append the latest NBA games into ``data/raw/game.csv``."""
 
-    today_local = date.today()
-
     # read existing and canonicalise before using it
     if GAME_CSV.exists():
         existing_game_df = pd.read_csv(GAME_CSV)
         existing_game_df = _canonicalise(existing_game_df)
-        if not existing_game_df.empty:
-            fetch_from_date = existing_game_df["game_date"].max()
-            # bump +1 day only for normal daily (no explicit backfill)
-            if not start_date:
-                fetch_from_date = (pd.to_datetime(fetch_from_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     else:
         existing_game_df = pd.DataFrame()
 
-    if start_date:
-        fetch_from = start_date
-    elif not existing_game_df.empty:
-        fetch_from = (pd.to_datetime(existing_game_df["game_date"].max()) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        # If no existing data and no start_date, start from a reasonable default, e.g., 2023-01-01
-        fetch_from = "2023-01-01" # Or some other sensible default
 
-    if end_date:
-        fetch_until = end_date
-    else:
-        fetch_until = today_local.strftime("%Y-%m-%d")
+    fetch_from, fetch_until = _get_fetch_dates(start_date, end_date)
 
-    # ... after you obtain new_games_df ...
-    new_rows = extract.get_league_game_log_from_date(fetch_from, fetch_until)
+    LOGGER.info(f"Fetching data from {fetch_from} to {fetch_until}")
+    new_rows = extract.get_league_game_log_from_date(fetch_from.strftime('%Y-%m-%d'), fetch_until.strftime('%Y-%m-%d'))
     new_rows = _canonicalise(new_rows)
     if new_rows is None or new_rows.empty:
         LOGGER.info("No new games found. Exiting...")

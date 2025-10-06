@@ -1,16 +1,32 @@
+# Python
 __pycache__/
 *.py[cod]
-.env
+*.pyo
+*.pyd
+
+# Envs
 .venv/
-*.sqlite
-*.db
-*.zip
+venv/
+.env
+
+# OS junk
+.DS_Store
+
+# Logs
+logs/
 *.log
-nba-db/
-data/external/
-data/raw/*.csv
-data/raw/*.json
-.eggs/
-build/
-dist/
-*.egg-info/
+
+# Data (Kaggle dumps, DBs, artifacts) — don't commit these
+data/
+!data/.gitkeep
+*.duckdb
+*.db
+*.sqlite
+*.parquet
+*.feather
+*.zip
+*.gz
+*.csv   # if you want some CSVs tracked, delete this line and rely on data/ above
+
+# Notebooks
+.ipynb_checkpoints/
