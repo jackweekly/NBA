@@ -10,66 +10,9 @@ import subprocess
 import sys
 from datetime import datetime
 
-import gzip, shutil, sqlite3, sys
-from pathlib import Path
 import pandas as pd
 
 from nba_db.paths import GAME_CSV, RAW_DIR, ROOT
-
-
-def _first_existing(*candidates: list[Path]) -> Path | None:
-  for p in candidates:
-    if p and p.exists():
-      return p
-  return None
-
-def find_or_materialize_game_csv() -> Path | None:
-  # 1) direct or nested CSVs (case-insensitive)
-  csvs = list(RAW_DIR.rglob("game.csv")) + list(RAW_DIR.rglob("Game.csv"))
-  if not csvs:
-    csvs = list(RAW_DIR.rglob("games.csv")) + list(RAW_DIR.rglob("Games.csv"))
-  if csvs:
-    src = csvs[0]
-    src = src.resolve()
-    if src.suffix == ".csv":
-      return src
-
-  # 2) gzipped CSV
-  gz = _first_existing(*(RAW_DIR.rglob("game.csv.gz")))
-  if gz:
-    tmp = gz.with_suffix("")  # strip .gz
-    with gzip.open(gz, "rb") as f_in, open(tmp, "wb") as f_out:
-      shutil.copyfileobj(f_in, f_out)
-    return tmp
-
-  # 3) SQLite fallback → dump table 'game'
-  sqlite_files = list(RAW_DIR.rglob("*.sqlite")) + list(RAW_DIR.rglob("*.db"))
-  if sqlite_files:
-    db = sqlite_files[0]
-    with sqlite3.connect(db) as conn:
-      try:
-        df = pd.read_sql("SELECT * FROM game", conn)
-      except Exception as e:
-        print(f"[ERROR] Could not read 'game' table from {db}: {e}", file=sys.stderr)
-        return None
-    out = RAW_DIR / "game.csv"
-    df.to_csv(out, index=False)
-    return out
-
-  return None
-
-def normalize_and_place_game_csv(src_csv: Path) -> None:
-  RAW_DIR.mkdir(parents=True, exist_ok=True)
-  df = pd.read_csv(src_csv)
-  df.columns = df.columns.str.lower()
-  if "game_date" in df.columns:
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-  if "season_type" not in df.columns:
-    df["season_type"] = "Regular Season"
-  tmp = GAME_CSV.with_suffix(".csv.tmp")
-  df.to_csv(tmp, index=False)
-  tmp.replace(GAME_CSV)
-  print(f"[OK] Seeded {GAME_CSV} rows={len(df)}, window={df['game_date'].min()}→{df['game_date'].max()}")
 
 
 DEFAULT_DATASET_ID = "wyattowalsh/basketball"
@@ -164,11 +107,44 @@ def _download_dataset(dataset_id: str, *, force: bool) -> None:
         raise SystemExit(1) from exc
 
 
+def _normalise_game_csv() -> pd.DataFrame:
+    alt_path = RAW_DIR / "games.csv"
+    if alt_path.exists() and not GAME_CSV.exists():
+        logging.info("Renaming %s -> %s", alt_path.name, GAME_CSV.name)
+        alt_path.rename(GAME_CSV)
+
+    if not GAME_CSV.exists():
+        raise SystemExit(
+            f"Expected {GAME_CSV} after Kaggle download. Ensure the dataset contains game.csv/games.csv"
+        )
+
+    frame = pd.read_csv(GAME_CSV)
+    if frame.empty:
+        frame.columns = [col.lower() for col in frame.columns]
+    else:
+        frame.columns = frame.columns.str.lower()
+
+    if "game_date" in frame.columns:
+        frame["game_date"] = pd.to_datetime(frame["game_date"], errors="coerce")
+
+    if "season_type" not in frame.columns:
+        frame["season_type"] = DEFAULT_SEASON_TYPE
+    else:
+        frame["season_type"] = (
+            frame["season_type"].fillna(DEFAULT_SEASON_TYPE).replace("", DEFAULT_SEASON_TYPE)
+        )
+
+    for column in ("season_id", "game_id", "team_id"):
+        if column in frame.columns:
+            frame[column] = frame[column].astype(str).str.strip()
+
+    tmp_path = GAME_CSV.with_suffix(".tmp")
+    frame.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, GAME_CSV)
+    return frame
 
 
-
-def _log_summary() -> None:
-    frame = pd.read_csv(GAME_CSV, parse_dates=['game_date'])
+def _log_summary(frame: pd.DataFrame) -> None:
     row_count = len(frame)
     if "game_date" in frame.columns and not frame["game_date"].dropna().empty:
         min_date = frame["game_date"].min()
@@ -205,17 +181,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _ensure_kaggle_cli()
     _download_dataset(args.dataset_id, force=args.force)
-
-    src = find_or_materialize_game_csv()
-    if not src:
-      # Debugging aid: show what *was* downloaded
-      print(f"[ERROR] Could not locate game.csv. Files under {RAW_DIR}:", file=sys.stderr)
-      for p in RAW_DIR.rglob("*"):
-        print(" -", p.relative_to(RAW_DIR), file=sys.stderr)
-      sys.exit(1)
-
-    normalize_and_place_game_csv(src)
-    _log_summary()
+    frame = _normalise_game_csv()
+    _log_summary(frame)
 
     logging.info("Finished Kaggle bootstrap")
     return 0
