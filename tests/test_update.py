@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 import types
 
+from requests import exceptions as requests_exceptions
+
 import pandas as pd
 import pytest
 
@@ -95,3 +97,48 @@ def test_get_league_game_log_from_date_bounds(monkeypatch):
 
     assert not frame.empty
     assert any(season == "2020-21" for season, *_ in calls)
+
+
+def test_call_with_retry_retries_then_succeeds(monkeypatch):
+    attempts = 0
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    def flaky_call():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise requests_exceptions.ReadTimeout("timeout", request=None)
+        return pd.DataFrame({"value": [1]})
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    frame = update._call_with_retry("example", flaky_call)
+
+    assert attempts == 3
+    assert sleeps == [1, 2]
+    assert not frame.empty
+
+
+def test_call_with_retry_exhausts_attempts(monkeypatch):
+    attempts = 0
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    def failing_call():
+        nonlocal attempts
+        attempts += 1
+        raise requests_exceptions.Timeout("timeout", request=None)
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        update._call_with_retry("player", failing_call)
+
+    assert "Failed to fetch player" in str(excinfo.value)
+    assert attempts == update.MAX_REQUEST_RETRIES
+    assert sleeps == [1, 2, 4, 8]
