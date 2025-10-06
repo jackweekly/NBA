@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 import types
 
+from requests import exceptions as requests_exceptions
+
 import pandas as pd
 import pytest
 from requests import exceptions as requests_exceptions
@@ -44,6 +46,18 @@ def test_daily_incremental_appends(monkeypatch, tmp_path):
     assert result.appended is True
     assert result.rows_written == len(new_frame)
     assert result.final_row_count == 2
+
+
+def test_next_start_date_handles_lowercase_columns(monkeypatch, tmp_path):
+    _setup_config(tmp_path, monkeypatch)
+    game_csv = tmp_path / "data/raw/game.csv"
+    game_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "game_id": ["0001"],
+        "game_date": ["2020-01-01"],
+    }).to_csv(game_csv, index=False)
+
+    assert update._next_start_date(game_csv) == date(2020, 1, 2)
 
 
 def test_next_start_date_handles_lowercase_columns(monkeypatch, tmp_path):

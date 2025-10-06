@@ -177,6 +177,38 @@ def _read_game_log(path: Path) -> pd.DataFrame:
     return _standardise_game_log(frame)
 
 
+def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``frame`` with lower-case column names."""
+
+    if frame.empty:
+        renamed = frame.copy()
+        renamed.columns = [col.lower() for col in frame.columns]
+        return renamed
+    return frame.rename(columns=str.lower)
+
+
+def _normalise_key_columns(frame: pd.DataFrame, columns: Sequence[str]) -> None:
+    """Normalise key columns in-place for deduplication comparisons."""
+
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        series = frame[column].astype(str).str.strip()
+        if column in NUMERIC_KEY_COLUMNS:
+            series = series.str.lstrip("0").replace({"": "0"})
+        frame[column] = series
+
+
+def _deduplicate_game_log(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate rows from a canonical game log frame."""
+
+    canonical = _canonicalize_columns(frame)
+    available_subset = [column for column in GAME_LOG_PRIMARY_KEY if column in canonical.columns]
+    if not available_subset:
+        return canonical.drop_duplicates(ignore_index=True)
+    return canonical.drop_duplicates(subset=available_subset, keep="last", ignore_index=True)
+
+
 def _season_range(start: date, end: date) -> Iterable[int]:
     start_year = start.year if start.month >= 7 else start.year - 1
     end_year = end.year if end.month >= 7 else end.year - 1
