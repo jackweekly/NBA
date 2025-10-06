@@ -6,12 +6,11 @@ import sys
 
 import pandas as pd
 
-from nba_db import paths
+from nba_db.paths import GAME_CSV
 
 
 def main() -> int:
-    config = paths.load_config()
-    game_path = paths.game_log_path(config=config)
+    game_path = GAME_CSV
     if not game_path.exists():
         print(f"No game.csv found at {game_path}", file=sys.stderr)
         return 1
