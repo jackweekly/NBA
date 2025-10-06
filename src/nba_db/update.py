@@ -11,7 +11,8 @@ try:  # pragma: no cover - optional dependency in the lightweight environment
     import yaml
 except ModuleNotFoundError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
-from nba_api.stats import static as stats_static
+from nba_api.stats.static import players as static_players
+from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import (
     boxscoresummaryv2,
     commonplayerinfo,
@@ -231,7 +232,7 @@ def _write_dataframe(path: Path, frame: pd.DataFrame, *, append: bool) -> int:
 
 
 def _fetch_all_players() -> pd.DataFrame:
-    players = stats_static.players.get_players()
+    players = static_players.get_players()
     frames: list[pd.DataFrame] = []
     for meta in players:
         endpoint = commonplayerinfo.CommonPlayerInfo(player_id=meta["id"])
@@ -244,7 +245,7 @@ def _fetch_all_players() -> pd.DataFrame:
 
 
 def _fetch_all_teams() -> pd.DataFrame:
-    teams = stats_static.teams.get_teams()
+    teams = static_teams.get_teams()
     frames: list[pd.DataFrame] = []
     for meta in teams:
         endpoint = teaminfocommon.TeamInfoCommon(team_id=meta["id"])
