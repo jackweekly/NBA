@@ -23,33 +23,34 @@ DAILY_SEASON_TYPES = ["Regular Season", "Playoffs", "PlayIn", "In-Season Tournam
 SEASON_TYPE_MAP = {
     "regular season": "Regular Season",
     "playoffs": "Playoffs",
-    "pre season": "Pre Season",
-    "preseason": "Pre Season",
     "playin": "PlayIn",
     "play-in": "PlayIn",
-    "in season tournament": "In-Season Tournament",
+    "preseason": "Pre Season",
+    "pre season": "Pre Season",
+    "in season tournament": "In-Season Tournament",  # MUST be hyphenated
     "in-season tournament": "In-Season Tournament",
 }
 
-def _canonical_season_type(s: str | None) -> str | None:
-    if not s:
-        return None
-    return SEASON_TYPE_MAP.get(s.strip().lower(), s)
+def _canon_season_type(s):
+    return SEASON_TYPE_MAP.get((s or "").strip().lower()) or s
 
-def _season_types_for_window(window_start: date, window_end: date, season_start_year: int):
-    # rough guards – cheap and effective
-    out = set(["Regular Season"])  # default assumption
-    # Pre Season Sep-Oct
-    if 9 <= window_start.month <= 10 or 9 <= window_end.month <= 10:
-        out.add("Pre Season")
-    # Play-In & Playoffs mid-Apr → Jun
-    if window_end.month >= 4:
-        out.add("PlayIn")
-        out.add("Playoffs")
-    # In-Season Tournament Nov–Dec
-    if 11 <= window_start.month <= 12 or 11 <= window_end.month <= 12:
-        out.add("In-Season Tournament")
-    return sorted(list(out))
+def season_types_for_window(start: date, end: date) -> list[str]:
+    # Cheap guards to reduce empty calls
+    types = set()
+    # Regular season runs Oct–Apr
+    if 10 <= start.month <= 12 or 1 <= end.month <= 4:
+        types.add("Regular Season")
+    # Preseason late Sep–Oct
+    if start.month in {9,10} or end.month in {9,10}:
+        types.add("Pre Season")
+    # In-Season Tournament in Nov–Dec
+    if 11 <= start.month <= 12 or 11 <= end.month <= 12:
+        types.add("In-Season Tournament")
+    # Play-In and Playoffs mid-Apr–Jun
+    if end.month >= 4:
+        types.add("PlayIn")
+        types.add("Playoffs")
+    return sorted(types)
 
 def _is_retryable_http(e: Exception) -> bool:
     if isinstance(e, HTTPError) and e.response is not None:
@@ -95,6 +96,36 @@ def _latest_started_season_year(today: date) -> int:
 def _format_for_api(value: Optional[date]) -> Optional[str]:
     return value.strftime("%m/%d/%Y") if value else None
 
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    stop=stop_after_attempt(4),
+    retry=retry_if_exception(_is_retryable_http),
+    reraise=True,
+)
+def _call_leaguegamelog(season, season_type_raw, formatted_from, formatted_to, proxy_to_use):
+    season_type = _canon_season_type(season_type_raw) # Canonicalize season type
+    base_url = "https://stats.nba.com/stats/leaguegamelog"
+    params = {
+        "LeagueID": "00", # NBA
+        "Season": season,
+        "SeasonType": season_type,
+        "PlayerOrTeam": "T", # Team
+        "Counter": 0,
+        "Sorter": "DATE",
+        "Direction": "ASC",
+        "DateFrom": formatted_from,
+        "DateTo": formatted_to,
+    }
+
+    response = requests.get(
+        base_url,
+        params=params,
+        headers=NBA_API_HEADERS,
+        proxies={"http": proxy_to_use, "https": proxy_to_use} if proxy_to_use else None,
+        timeout=10, # Use 10s timeout as suggested
+    )
+    response.raise_for_status() # Raise an exception for HTTP errors
+    return response.json()
 
 
 
@@ -103,128 +134,44 @@ def _format_for_api(value: Optional[date]) -> Optional[str]:
 
 
 
-def get_league_game_log_from_date(
-    datefrom: str,
-    dateto: Optional[str] = None,
-    *,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> pd.DataFrame:
-    """Fetch league game logs between ``datefrom`` and ``dateto`` (inclusive)."""
 
-    # Convert string dates to date objects
-    datefrom_obj = date.fromisoformat(datefrom)
-    dateto_obj = date.fromisoformat(dateto) if dateto else None
+def get_league_game_log_from_date(date_from: str, date_to: str, proxies=None) -> pd.DataFrame:
+    start = pd.to_datetime(date_from)
+    end   = pd.to_datetime(date_to)
 
-    today = date.today()
-    latest_season_year = _latest_started_season_year(today)
-    effective_end = dateto_obj if dateto_obj else date.today()
+    dfs = []
+    for st in season_types_for_window(start, end):
+        st_canonical = _canon_season_type(st) # Use canonical season type
+        # one request per valid season type
+        try:
+            proxy_to_use = random.choice(proxies) if proxies else None
+            raw_data = _call_leaguegamelog(start.year, st_canonical, date_from, date_to, proxy_to_use) # Pass canonical season type
+            if "resultSets" not in raw_data:
+                LOGGER.warning(f"'resultSets' not found in API response for {st_canonical} from {date_from} to {date_to}. Response: {raw_data}")
+                continue # Continue to next season type
 
-    # Adjust effective_start if it's before the earliest season in the database
-    # (logic for this is not shown in the provided snippet, but assumed to be here)
+            # Assuming the first resultSet contains the game log data
+            game_log_data = raw_data["resultSets"][0]
+            headers = game_log_data["headers"]
+            rows = game_log_data["rowSet"]
+            df = pd.DataFrame(rows, columns=headers)
 
-    effective_end_year = min(_season_year_for_date(effective_end), latest_season_year)
-    start_year = _season_year_for_date(datefrom_obj)
+            if df is not None and not df.empty:
+                dfs.append(df)
+        except HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code == 400:
+                LOGGER.warning(f"Skipping season_type={st_canonical} for {start.year}: server says 400 (likely invalid SeasonType/date combo or label).")
+                continue # Continue to next season type
+            raise # Re-raise other HTTP errors
 
-    if start_year > latest_season_year:
-        LOGGER.info("Start date %s is in a future season; returning empty frame", datefrom_obj)
+    if not dfs:
         return pd.DataFrame()
-
-    frames: list[pd.DataFrame] = []
-    proxies = get_proxies()
-
-    for season_year in range(start_year, effective_end_year + 1):
-        season = _season_label(season_year)
-        season_start = date(season_year, 7, 1)
-        season_end = date(season_year + 1, 6, 30)
-        season_from = datefrom_obj if season_year == start_year else season_start
-        season_to = effective_end if season_year == effective_end_year else season_end
-
-        for season_type_raw in _season_types_for_window(season_from, season_to, season_year):
-            formatted_from = _format_for_api(season_from if season_from >= season_start else season_start)
-            formatted_to = _format_for_api(season_to if season_to <= season_end else season_end)
-
-            @retry(
-                wait=wait_exponential(multiplier=1, min=2, max=8),
-                stop=stop_after_attempt(4),
-                retry=retry_if_exception(_is_retryable_http),
-                reraise=True,
-            )
-            def _make_api_request(season, season_type_raw, formatted_from, formatted_to, proxy_to_use):
-                season_type = _canonical_season_type(season_type_raw) # Canonicalize season type
-                base_url = "https://stats.nba.com/stats/leaguegamelog"
-                params = {
-                    "LeagueID": "00", # NBA
-                    "Season": season,
-                    "SeasonType": season_type,
-                    "PlayerOrTeam": "T", # Team
-                    "Counter": 0,
-                    "Sorter": "DATE",
-                    "Direction": "ASC",
-                    "DateFrom": formatted_from,
-                    "DateTo": formatted_to,
-                }
-
-                response = requests.get(
-                    base_url,
-                    params=params,
-                    headers=NBA_API_HEADERS,
-                    proxies={"http": proxy_to_use, "https": proxy_to_use} if proxy_to_use else None,
-                    timeout=10, # Use 10s timeout as suggested
-                )
-                response.raise_for_status() # Raise an exception for HTTP errors
-                return response.json()
-
-            try:
-                proxy_to_use = random.choice(proxies) if proxies else None
-                raw_data = _make_api_request(season, season_type_raw, formatted_from, formatted_to, proxy_to_use)
-
-                if "resultSets" not in raw_data:
-                    LOGGER.warning(f"'resultSets' not found in API response for {season_type_raw} from {formatted_from} to {formatted_to}. Response: {raw_data}")
-                    continue # Continue to next season_type
-
-                # Assuming the first resultSet contains the game log data
-                game_log_data = raw_data["resultSets"][0]
-                headers = game_log_data["headers"]
-                rows = game_log_data["rowSet"]
-                df = pd.DataFrame(rows, columns=headers)
-
-                if df.empty:
-                    LOGGER.info(f"No data returned for {season_type_raw} from {formatted_from} to {formatted_to}.")
-                    continue # Continue to next season_type
-                # normalize here so callers can rely on shape
-                df.columns = df.columns.str.lower()
-                if "game_date" in df.columns:
-                    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-                df["season_type"] = _canonical_season_type(season_type_raw) # Use canonical season type
-                # DO NOT self-merge; keep per-team rows
-                frames.append(df)
-            except HTTPError as e:
-                code = e.response.status_code if e.response is not None else None
-                if code == 400:
-                    LOGGER.warning(f"Skipping season_type={season_type_raw} for {season}: server says 400 (likely invalid SeasonType/date combo or label).")
-                    continue # Continue to next season type
-                raise # Re-raise other HTTP errors
-            except requests.exceptions.RequestException as e:
-                LOGGER.error(f"RequestException for {season_type_raw} from {formatted_from} to {formatted_to}: {e}")
-                # Tenacity will handle retries, so we just log and let it retry or fail
-            except json.JSONDecodeError as e:
-                LOGGER.error(f"JSONDecodeError for {season_type_raw} from {formatted_from} to {formatted_to}: {e}. Response content: {response.text}")
-                # Tenacity does not retry on JSONDecodeError by default, so we log and continue
-            time.sleep(REQUEST_SLEEP_SECONDS) # Politeness sleep after each successful call
-
-    if not frames:
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    if "game_date" in combined.columns:
-        upper_bound = dateto_obj or effective_end
-        mask = combined["game_date"].isna() | (
-            (combined["game_date"].dt.date >= datefrom_obj) &
-            (combined["game_date"].dt.date <= upper_bound)
-        )
-        combined = combined[mask]
-        combined.reset_index(drop=True, inplace=True)
-    return combined
-
-
-__all__ = ["get_league_game_log_from_date", "SEASON_TYPES"]
+    out = pd.concat(dfs, ignore_index=True)
+    # normalize once here
+    out.columns = out.columns.str.lower()
+    if "game_date" in out.columns:
+        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    if "season_type" not in out.columns:
+        out["season_type"] = st_canonical  # best-effort; usually present from API
+    return out

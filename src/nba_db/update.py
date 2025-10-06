@@ -6,6 +6,8 @@ import os
 import tempfile
 from dataclasses import dataclass
 from datetime import date, timedelta, datetime
+from pandas.tseries.offsets import MonthEnd
+from pandas import Timestamp
 from pathlib import Path
 from typing import Optional
 
@@ -44,7 +46,7 @@ def _atomic_write_csv(df: pd.DataFrame, out_path: Path | str):
 
 def _get_last_updated_date() -> date:
     if GAME_CSV.exists():
-        existing_game_df = pd.read_csv(GAME_CSV, usecols=["game_date", "game_id", "season_id", "team_id_home", "team_id_away", "season_type"], dtype_backend="pyarrow")
+        existing_game_df = pd.read_csv(GAME_CSV, usecols=["game_date", "game_id", "season_id", "season_type"], dtype_backend="pyarrow")
         existing_game_df = _canonicalise(existing_game_df)
         if not existing_game_df.empty and "game_date" in existing_game_df.columns:
             return existing_game_df["game_date"].max().date()
@@ -52,30 +54,7 @@ def _get_last_updated_date() -> date:
         f"Game CSV not found at {GAME_CSV}. Please run `run_init.py` to initialize the database."
     )
 
-def _get_fetch_dates(start_date_str: Optional[str], end_date_str: Optional[str]) -> Tuple[date, date]:
-    """
-    Determines the effective start and end dates for data fetching.
 
-    Args:
-        start_date_str (str, optional): User-provided start date string.
-        end_date_str (str, optional): User-provided end date string.
-
-    Returns:
-        Tuple[date, date]: A tuple containing the effective start and end date objects.
-    """
-    last_updated_date = _get_last_updated_date()
-
-    if start_date_str:
-        fetch_from = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    else:
-        fetch_from = last_updated_date + timedelta(days=1)
-
-    if end_date_str:
-        fetch_until = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-    else:
-        fetch_until = date.today()
-
-    return fetch_from, fetch_until
 
 
 def _log_fetch_window(df: pd.DataFrame):
@@ -166,37 +145,71 @@ def daily(
         existing_game_df = pd.DataFrame()
 
 
-    fetch_from, fetch_until = _get_fetch_dates(start_date, end_date)
+    if existing_game_df.empty or "game_date" not in existing_game_df.columns:
+        fetch_from = pd.Timestamp("2020-01-01")  # or first date you want
+    else:
+        last = existing_game_df["game_date"].max()
+        if pd.isna(last):
+            fetch_from = pd.Timestamp("2020-01-01")
+        else:
+            fetch_from = (last + pd.Timedelta(days=1)).normalize()
 
-    LOGGER.info(f"Fetching data from {fetch_from} to {fetch_until}")
+    today = pd.Timestamp.today().normalize()
+    fetch_until = min(today, pd.to_datetime(end_date).normalize()) if end_date else today
 
-    new_rows = extract.get_league_game_log_from_date(fetch_from.strftime('%Y-%m-%d'), fetch_until.strftime('%Y-%m-%d'))
-    new_rows = _canonicalise(new_rows)
-    if new_rows is None or new_rows.empty:
-        LOGGER.info("No new games found. Exiting...")
+    if start_date:
+        fetch_from = pd.to_datetime(start_date).normalize()
+
+    if fetch_from > fetch_until:
+        LOGGER.info("No new games today. Exiting...")
         return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing_game_df))
 
-    _log_fetch_window(new_rows)
+    LOGGER.info(f"Resume window computed as {fetch_from.date()} → {fetch_until.date()}")
+
+    cursor = fetch_from
+    end    = fetch_until
+
+    collected = []
+    while cursor <= end:
+        month_end = (cursor + pd.offsets.MonthEnd(0))
+        window_end = min(month_end, end)
+
+        LOGGER.info(f"Fetching data from {cursor.date()} to {window_end.date()}")
+
+        # Single discovery call (or minimal per-season_type)
+        df_win = extract.get_league_game_log_from_date(
+            cursor.strftime("%Y-%m-%d"),
+            window_end.strftime("%Y-%m-%d"),
+        )
+
+        if df_win is not None and not df_win.empty:
+            collected.append(df_win)
+
+        # advance to first day of next month
+        cursor = (month_end + pd.Timedelta(days=1)).normalize()
+
+    # After the loop:
+    if not collected:
+        LOGGER.info("No new games found across the entire requested window. Exiting...")
+        return DailyUpdateResult(GAME_CSV, 0, appended=True, final_row_count=len(existing_game_df))
+
+    new_rows = pd.concat(collected, ignore_index=True)
+    new_rows = _canonicalise(new_rows)
 
     # ensure season_type exists (Kaggle sometimes lacks it)
     if "season_type" not in new_rows.columns:
         new_rows["season_type"] = "Regular Season"
 
     if GAME_CSV.exists():
-        # Append new rows
-
-        new_rows.to_csv(GAME_CSV, mode="a", header=False, index=False)
-        appended_rows = len(new_rows)
-        final_row_count = len(existing_game_df) + appended_rows
-        LOGGER.info(f"Appended {appended_rows} new rows to {GAME_CSV}")
+        new_rows.to_csv(GAME_CSV, mode="a", index=False, header=False)
+        appended = True
     else:
-        # Write new file
-        _atomic_write_csv(new_rows, GAME_CSV)
-        appended_rows = len(new_rows)
-        final_row_count = appended_rows
-        LOGGER.info(f"Wrote {final_row_count} total rows to {GAME_CSV}")
+        new_rows.to_csv(GAME_CSV, index=False)
+        appended = False
 
-    return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_row_count)
+    LOGGER.info(f"Daily update wrote {len(new_rows)} new rows to {GAME_CSV} (appended={appended})")
+
+    return DailyUpdateResult(GAME_CSV, len(new_rows), appended=appended, final_row_count=len(existing_game_df) + len(new_rows) if appended else len(new_rows))
 
 
 __all__ = ["DailyUpdateResult", "daily"]
