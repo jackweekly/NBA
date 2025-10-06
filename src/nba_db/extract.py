@@ -7,10 +7,11 @@ import time
 from datetime import date
 from typing import Optional, Tuple
 import json
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 import pandas as pd
 import requests
-from nba_api.stats.endpoints import leaguegamelog
+
 from requests import exceptions as requests_exceptions
 
 from .utils import get_proxies
@@ -21,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 SEASON_TYPES = [
     "Regular Season",
     "Playoffs",
-    "Pre Season",
+    "PlayIn",
     "In Season Tournament",
 ]
 
@@ -42,7 +43,7 @@ NBA_API_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
-REQUEST_SLEEP_SECONDS = 0.0
+REQUEST_SLEEP_SECONDS = 1.0
 DEFAULT_TIMEOUT = 10
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 10
@@ -112,62 +113,61 @@ def get_league_game_log_from_date(
             formatted_from = _format_for_api(season_from if season_from >= season_start else season_start)
             formatted_to = _format_for_api(season_to if season_to <= season_end else season_end)
 
-            while True:
-                try:
-                    proxy_to_use = random.choice(proxies) if proxies else None
-                    # Manually construct the URL for leaguegamelog
-                    base_url = "https://stats.nba.com/stats/leaguegamelog"
-                    params = {
-                        "LeagueID": "00", # NBA
-                        "Season": season,
-                        "SeasonType": season_type,
-                        "PlayerOrTeam": "T", # Team
-                        "Counter": 0,
-                        "Sorter": "DATE",
-                        "Direction": "ASC",
-                        "DateFrom": formatted_from,
-                        "DateTo": formatted_to,
-                    }
+            @retry(wait=wait_exponential(min=1, max=6), stop=stop_after_attempt(4), retry=retry_if_exception_type(requests.exceptions.RequestException))
+            def _make_api_request(season, season_type, formatted_from, formatted_to, proxy_to_use):
+                base_url = "https://stats.nba.com/stats/leaguegamelog"
+                params = {
+                    "LeagueID": "00", # NBA
+                    "Season": season,
+                    "SeasonType": season_type,
+                    "PlayerOrTeam": "T", # Team
+                    "Counter": 0,
+                    "Sorter": "DATE",
+                    "Direction": "ASC",
+                    "DateFrom": formatted_from,
+                    "DateTo": formatted_to,
+                }
 
-                    response = requests.get(
-                        base_url,
-                        params=params,
-                        headers=NBA_API_HEADERS,
-                        proxies={"http": proxy_to_use, "https": proxy_to_use} if proxy_to_use else None,
-                        timeout=DEFAULT_TIMEOUT,
-                    )
-                    response.raise_for_status() # Raise an exception for HTTP errors
-                    raw_data = response.json()
+                response = requests.get(
+                    base_url,
+                    params=params,
+                    headers=NBA_API_HEADERS,
+                    proxies={"http": proxy_to_use, "https": proxy_to_use} if proxy_to_use else None,
+                    timeout=10, # Use 10s timeout as suggested
+                )
+                response.raise_for_status() # Raise an exception for HTTP errors
+                return response.json()
 
-                    if "resultSets" not in raw_data:
-                        LOGGER.warning(f"'resultSets' not found in API response for {season_type} from {formatted_from} to {formatted_to}. Response: {raw_data}")
-                        break # Break from while loop and try next season_type
+            try:
+                proxy_to_use = random.choice(proxies) if proxies else None
+                raw_data = _make_api_request(season, season_type, formatted_from, formatted_to, proxy_to_use)
 
-                    # Assuming the first resultSet contains the game log data
-                    game_log_data = raw_data["resultSets"][0]
-                    headers = game_log_data["headers"]
-                    rows = game_log_data["rowSet"]
-                    df = pd.DataFrame(rows, columns=headers)
+                if "resultSets" not in raw_data:
+                    LOGGER.warning(f"'resultSets' not found in API response for {season_type} from {formatted_from} to {formatted_to}. Response: {raw_data}")
+                    continue # Continue to next season_type
 
-                    if df.empty:
-                        LOGGER.info(f"No data returned for {season_type} from {formatted_from} to {formatted_to}.")
-                        break
-                    # normalize here so callers can rely on shape
-                    df.columns = df.columns.str.lower()
-                    if "game_date" in df.columns:
-                        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-                    df["season_type"] = season_type
-                    # DO NOT self-merge; keep per-team rows
-                    frames.append(df)
-                    break
-                except requests.exceptions.RequestException as e:
-                    LOGGER.error(f"RequestException for {season_type} from {formatted_from} to {formatted_to}: {e}")
-                    time.sleep(5) # Sleep for 5 seconds before retrying
-                    continue
-                except json.JSONDecodeError as e:
-                    LOGGER.error(f"JSONDecodeError for {season_type} from {formatted_from} to {formatted_to}: {e}. Response content: {response.text}")
-                    time.sleep(5) # Sleep for 5 seconds before retrying
-                    continue
+                # Assuming the first resultSet contains the game log data
+                game_log_data = raw_data["resultSets"][0]
+                headers = game_log_data["headers"]
+                rows = game_log_data["rowSet"]
+                df = pd.DataFrame(rows, columns=headers)
+
+                if df.empty:
+                    LOGGER.info(f"No data returned for {season_type} from {formatted_from} to {formatted_to}.")
+                    continue # Continue to next season_type
+                # normalize here so callers can rely on shape
+                df.columns = df.columns.str.lower()
+                if "game_date" in df.columns:
+                    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+                df["season_type"] = season_type
+                # DO NOT self-merge; keep per-team rows
+                frames.append(df)
+            except requests.exceptions.RequestException as e:
+                LOGGER.error(f"RequestException for {season_type} from {formatted_from} to {formatted_to}: {e}")
+                # Tenacity will handle retries, so we just log and let it retry or fail
+            except json.JSONDecodeError as e:
+                LOGGER.error(f"JSONDecodeError for {season_type} from {formatted_from} to {formatted_to}: {e}. Response content: {response.text}")
+                # Tenacity does not retry on JSONDecodeError by default, so we log and continue
             time.sleep(REQUEST_SLEEP_SECONDS) # Politeness sleep after each successful call
 
     if not frames:

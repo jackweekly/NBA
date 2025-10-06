@@ -20,6 +20,14 @@ LOGGER = logging.getLogger(__name__)
 GAME_LOG_PRIMARY_KEY = ("game_id", "team_id", "season_type")
 DEFAULT_SEASON_TYPE = "Regular Season"
 
+DTYPE_HINTS = {
+    "GAME_ID": str,
+    "TEAM_ID": str,
+    "season_type": "category",
+    "WL": "category",
+    "TEAM_ABBREVIATION": "category",
+}
+
 
 def _canonicalise(df):
     """Lowercase columns and parse game_date; noop on None/empty."""
@@ -43,11 +51,13 @@ def _atomic_write_csv(df: pd.DataFrame, out_path: Path | str):
 
 def _get_last_updated_date() -> date:
     if GAME_CSV.exists():
-        existing_game_df = pd.read_csv(GAME_CSV)
+        existing_game_df = pd.read_csv(GAME_CSV, usecols=["game_date", "game_id", "season_id", "team_id_home", "team_id_away", "season_type"], dtype=DTYPE_HINTS)
         existing_game_df = _canonicalise(existing_game_df)
         if not existing_game_df.empty and "game_date" in existing_game_df.columns:
             return existing_game_df["game_date"].max().date()
-    return date(2023, 1, 1) # Default to a reasonable date if no data or game_date column
+    raise FileNotFoundError(
+        f"Game CSV not found at {GAME_CSV}. Please run `run_init.py` to initialize the database."
+    )
 
 def _get_fetch_dates(start_date_str: Optional[str], end_date_str: Optional[str]) -> Tuple[date, date]:
     """
@@ -81,7 +91,9 @@ def _log_fetch_window(df: pd.DataFrame):
         LOGGER.info("Fetched 0 rows.")
         return
     if "game_date" in df.columns:
-        LOGGER.info(f"Fetched {len(df)} new rows covering {df['game_date'].min()} \u2192 {df['game_date'].max()}")
+        min_date = df['game_date'].min()
+        max_date = df['game_date'].max()
+        LOGGER.info(f"Fetched {len(df)} new rows covering {min_date} \u2192 {max_date}")
     else:
         LOGGER.info(f"Fetched {len(df)} new rows (no game_date column present).")
 
@@ -155,7 +167,7 @@ def daily(
 
     # read existing and canonicalise before using it
     if GAME_CSV.exists():
-        existing_game_df = pd.read_csv(GAME_CSV)
+        existing_game_df = pd.read_csv(GAME_CSV, dtype=DTYPE_HINTS)
         existing_game_df = _canonicalise(existing_game_df)
     else:
         existing_game_df = pd.DataFrame()
@@ -172,25 +184,24 @@ def daily(
 
     _log_fetch_window(new_rows)
 
-    # merge, dedup on lowercase keys, then atomic write
-    if existing_game_df is not None and not existing_game_df.empty:
-        combined_df = pd.concat([existing_game_df, new_rows], ignore_index=True)
-    else:
-        combined_df = new_rows
-
     # ensure season_type exists (Kaggle sometimes lacks it)
-    if "season_type" not in combined_df.columns:
-        combined_df["season_type"] = "Regular Season"
+    if "season_type" not in new_rows.columns:
+        new_rows["season_type"] = "Regular Season"
 
-    combined_df.drop_duplicates(subset=["game_id", "team_id", "season_type"], keep="first", inplace=True)
+    if GAME_CSV.exists():
+        # Append new rows
+        new_rows.to_csv(GAME_CSV, mode="a", header=False, index=False)
+        appended_rows = len(new_rows)
+        final_row_count = len(existing_game_df) + appended_rows
+        LOGGER.info(f"Appended {appended_rows} new rows to {GAME_CSV}")
+    else:
+        # Write new file
+        _atomic_write_csv(new_rows, GAME_CSV)
+        appended_rows = len(new_rows)
+        final_row_count = appended_rows
+        LOGGER.info(f"Wrote {final_row_count} total rows to {GAME_CSV}")
 
-    _atomic_write_csv(combined_df, GAME_CSV)
-    final_count = len(combined_df)
-    appended_rows = max(final_count - len(existing_game_df), 0)
-
-    LOGGER.info(f"Wrote {final_count} total rows to {GAME_CSV}")
-
-    return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_count)
+    return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_row_count)
 
 
 __all__ = ["DailyUpdateResult", "daily"]
