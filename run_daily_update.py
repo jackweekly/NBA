@@ -55,11 +55,15 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     print(f"Starting daily update at {datetime.now().isoformat(timespec='seconds')}")
     if fetch_all_history:
-        update.daily(fetch_all_history=True)
+        result = update.daily(fetch_all_history=True)
     elif start_date:
-        update.daily(start_date=start_date)
+        result = update.daily(start_date=start_date)
     else:
-        update.daily()
+        result = update.daily()
+    print(
+        f"Wrote {result.rows_written} rows to {result.output_path}"
+        f" (appended={result.appended})"
+    )
     print(f"Finished daily update at {datetime.now().isoformat(timespec='seconds')}")
 
 

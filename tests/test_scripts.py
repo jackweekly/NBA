@@ -1,39 +1,43 @@
 from __future__ import annotations
 
 import os
-
-import pytest
-
 from pathlib import Path
 
+import pandas as pd
+import pytest
+
 from nba_db import update as nba_update
-from nbapredictor import nbadb_sync
 
 import run_daily_update
 
 
-def test_daily_fetch_all_history(monkeypatch):
-    captured: list[dict[str, object]] = []
+@pytest.fixture(autouse=True)
+def _set_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("raw:\n  raw_dir: data/raw\n", encoding="utf-8")
+    monkeypatch.setattr(nba_update, "_project_root", lambda: tmp_path)
+    yield
 
-    def fake_update_raw_data(**kwargs):
-        captured.append(kwargs)
-        return nbadb_sync.UpdateSummary([], [], [], [])
 
-    monkeypatch.setattr(nbadb_sync, "update_raw_data", fake_update_raw_data)
+def test_daily_fetch_all_history(monkeypatch, tmp_path):
+    frame = pd.DataFrame({"GAME_ID": ["0001"], "GAME_DATE": ["2020-01-01"]})
+    records: list[dict[str, object]] = []
 
-    result = nba_update.daily(fetch_all_history=True, output_dir="/tmp/output")
+    def fake_get_all():
+        records.append({"called": True})
+        return frame
 
-    assert captured == [
-        {
-            "output_dir": "/tmp/output",
-            "start_date": nbadb_sync.HISTORICAL_START_DATE.isoformat(),
-            "end_date": None,
-            "bootstrap_kaggle": False,
-            "force": False,
-            "fetch_all_history": True,
-        }
-    ]
-    assert result.summary.downloaded_files == []
+    monkeypatch.setattr(nba_update, "get_league_game_log_all", fake_get_all)
+
+    result = nba_update.daily(fetch_all_history=True)
+
+    assert records == [{"called": True}]
+    assert result.output_path == tmp_path / "data/raw/game.csv"
+    saved = pd.read_csv(result.output_path)
+    expected = frame.copy()
+    saved["GAME_ID"] = saved["GAME_ID"].astype(int)
+    expected["GAME_ID"] = expected["GAME_ID"].astype(int)
+    pd.testing.assert_frame_equal(saved, expected, check_dtype=False)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +60,7 @@ def test_run_daily_update_calls_daily(monkeypatch):
             "fetch_all_history": fetch_all_history,
             "start_date": start_date,
         })
+        return nba_update.DailyUpdateResult(Path("game.csv"), 0, False)
 
     monkeypatch.setattr(nba_update, "daily", fake_daily)
 
@@ -66,7 +71,7 @@ def test_run_daily_update_calls_daily(monkeypatch):
 
 def test_run_daily_update_sets_numeric_environment(monkeypatch):
     def fake_daily(**kwargs):  # noqa: ARG001 - behaviour under test
-        return None
+        return nba_update.DailyUpdateResult(Path("game.csv"), 0, False)
 
     monkeypatch.setattr(nba_update, "daily", fake_daily)
 
@@ -77,21 +82,3 @@ def test_run_daily_update_sets_numeric_environment(monkeypatch):
 
     for key, value in run_daily_update._NUMERIC_ENV_DEFAULTS.items():
         assert os.environ[key] == value
-
-
-def test_update_init_delegates_to_bootstrap(monkeypatch):
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def fake_bootstrap(path: Path, *, force: bool = False):
-        captured["path"] = path
-        captured["force"] = force
-        return sentinel
-
-    monkeypatch.setattr(nbadb_sync, "bootstrap_from_kaggle", fake_bootstrap)
-
-    result = nba_update.init(output_dir="/tmp/bootstrap", force=True)
-
-    assert captured["path"] == Path("/tmp/bootstrap")
-    assert captured["force"] is True
-    assert result is sentinel

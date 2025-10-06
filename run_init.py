@@ -33,12 +33,14 @@ def main() -> None:
     timestamp = datetime.now().isoformat(timespec="seconds")
     print(f"Starting init at {timestamp}")
     result = update.init()
-    if result.last_game_date:
-        print(
-            "Bootstrap completed up to",
-            result.last_game_date.isoformat(),
-        )
-    print(f"Imported {len(result.downloaded_files)} season files from {result.dataset_dir}")
+    print("Bootstrap completed. Files written:")
+    print(f"  Players: {result.player_path} ({result.row_counts['players']} rows)")
+    print(f"  Teams: {result.team_path} ({result.row_counts['teams']} rows)")
+    print(f"  Games: {result.game_path} ({result.row_counts['games']} rows)")
+    print(
+        f"  Game summaries: {result.game_summary_path} "
+        f"({result.row_counts['game_summaries']} rows)"
+    )
     print(f"Finished init at {datetime.now().isoformat(timespec='seconds')}")
 
 

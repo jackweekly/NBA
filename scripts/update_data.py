@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 from pathlib import Path
@@ -21,7 +20,7 @@ _NUMERIC_ENV_DEFAULTS = {
 for _env_key, _env_value in _NUMERIC_ENV_DEFAULTS.items():
     os.environ.setdefault(_env_key, _env_value)
 
-from nbapredictor.nbadb_sync import update_raw_data
+from nba_db import update as nba_update
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -43,21 +42,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional ISO date (YYYY-MM-DD) marking the last day to download.",
     )
     parser.add_argument(
-        "--bootstrap-kaggle",
-        action="store_true",
-        help="Download the upstream Kaggle dataset before fetching daily stats.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-download CSV files even if they already exist.",
-    )
-    parser.add_argument(
         "--fetch-all-history",
         action="store_true",
         help=(
-            "Download complete seasons instead of iterating day-by-day. "
-            "Outputs are partitioned by season inside leaguegamelog/."
+            "Download the full historical league game log instead of an incremental"
+            " update."
         ),
     )
     parser.add_argument(
@@ -74,15 +63,16 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
-    summary = update_raw_data(
+    result = nba_update.daily(
         output_dir=Path(args.output_dir),
         start_date=args.start_date,
         end_date=args.end_date,
-        bootstrap_kaggle=args.bootstrap_kaggle,
-        force=args.force,
         fetch_all_history=args.fetch_all_history,
     )
-    print(json.dumps(summary.to_dict(), indent=2))
+    print(
+        f"Wrote {result.rows_written} rows to {result.output_path} "
+        f"(appended={result.appended})"
+    )
 
 
 if __name__ == "__main__":
