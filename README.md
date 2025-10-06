@@ -1,0 +1,80 @@
+# NBA Predictor Data Pipeline
+
+This project provides a lightweight data ingestion layer for a future NBA prediction
+system. The helper utilities mirror the behaviour of
+[wyattowalsh/nbadb](https://github.com/wyattowalsh/nbadb)'s `nba_api_ingestion.py`
+script so you can bulk-download the canonical CSV files and keep them fresh with
+incremental updates.
+
+## Features
+
+* Resolves the raw data directory from `config.yaml`, matching the upstream
+  repository layout.
+* Pulls player, team, league game log and game summary tables directly from
+  the `nba_api` endpoints.
+* Provides a one-shot bootstrap that reproduces the historical CSVs published
+  in the Kaggle dataset (without needing Kaggle credentials).
+* Supports incremental backfills by date as well as full historical refreshes
+  via season-at-a-time downloads.
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+The package depends on `requests`, `pandas`, `nba_api`, and `python-dateutil`.
+
+## Usage
+
+The utilities look for `config.yaml` at the project root. The default file in
+this repository points `raw.raw_dir` to `data/raw`, matching the original repo.
+
+### One-time bootstrap
+
+Run the initial ingestion to create the canonical CSVs (players, teams, game
+logs, and game summaries):
+
+```bash
+python run_init.py
+```
+
+This command mirrors the historical behaviour of `nba_api_ingestion.py` by
+querying the `nba_api` endpoints and writing the following files under the raw
+data directory defined in `config.yaml`:
+
+* `common_player_info.csv`
+* `team_info_common.csv`
+* `game.csv`
+* `game_summary.csv`
+
+### Daily updates
+
+Trigger a full historical download (season-by-season) with:
+
+```bash
+python run_daily_update.py --fetch-all-history
+```
+
+For incremental backfills from a specific date:
+
+```bash
+python run_daily_update.py 2010-10-01
+```
+
+Running `python run_daily_update.py` without arguments appends games that were
+played after the last entry in `game.csv`. Both scripts initialise conservative
+defaults for OpenBLAS/MKL environment variables to avoid the "Floating point
+exception" crashes that can appear on certain virtualised CPUs.
+
+The helper `scripts/update_data.py` exposes the same options behind an
+`argparse` interface so you can integrate the downloader in other automation
+tools.
+
+## Testing
+
+The repository contains a small unit test suite. Execute it with `pytest`:
+
+```bash
+pytest
+```
