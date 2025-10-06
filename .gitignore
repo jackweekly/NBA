@@ -7,8 +7,10 @@ __pycache__/
 *.zip
 *.log
 nba-db/
+data/external/
 data/raw/*.csv
 data/raw/*.json
+data/*.duckdb
 .eggs/
 build/
 dist/
