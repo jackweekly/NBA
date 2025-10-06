@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 import types
 
+from requests import exceptions as requests_exceptions
+
 import pandas as pd
 import pytest
 
@@ -95,3 +97,76 @@ def test_get_league_game_log_from_date_bounds(monkeypatch):
 
     assert not frame.empty
     assert any(season == "2020-21" for season, *_ in calls)
+
+
+def test_call_with_retry_retries_then_succeeds(monkeypatch):
+    attempts = 0
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    timeouts_seen: list[int | float] = []
+
+    def flaky_call(timeout):
+        timeouts_seen.append(timeout)
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise requests_exceptions.ReadTimeout("timeout", request=None)
+        return pd.DataFrame({"value": [1]})
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    frame = update._call_with_retry("example", flaky_call)
+
+    assert attempts == 3
+    assert sleeps == [1, 2]
+    assert timeouts_seen == [update.DEFAULT_TIMEOUT, update.DEFAULT_TIMEOUT, update.DEFAULT_TIMEOUT]
+    assert not frame.empty
+
+
+def test_call_with_retry_exhausts_attempts(monkeypatch):
+    attempts = 0
+    sleeps: list[int] = []
+
+    def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    def failing_call(timeout):
+        nonlocal attempts
+        attempts += 1
+        raise requests_exceptions.Timeout("timeout", request=None)
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        update._call_with_retry("player", failing_call)
+
+    assert "Failed to fetch player" in str(excinfo.value)
+    assert attempts == update.MAX_REQUEST_RETRIES
+    assert sleeps == [1, 2, 4, 8]
+
+
+def test_call_with_retry_respects_timeout_plan(monkeypatch):
+    attempts = 0
+    seen_timeouts: list[int | float] = []
+
+    def fake_sleep(seconds: int) -> None:
+        pass
+
+    def failing_call(timeout):
+        nonlocal attempts
+        attempts += 1
+        seen_timeouts.append(timeout)
+        raise requests_exceptions.ConnectTimeout("timeout", request=None)
+
+    monkeypatch.setattr(update.time, "sleep", fake_sleep)
+
+    custom_timeouts = (1, 2, 4)
+
+    with pytest.raises(RuntimeError):
+        update._call_with_retry("custom", failing_call, timeouts=custom_timeouts)
+
+    assert attempts == update.MAX_REQUEST_RETRIES
+    assert seen_timeouts == [1, 2, 4, 4, 4]

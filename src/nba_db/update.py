@@ -33,15 +33,31 @@ SEASON_TYPES: tuple[str, ...] = (
 
 NBA_API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     ),
     "x-nba-stats-origin": "stats",
-    "Referer": "https://stats.nba.com/",
+    "x-nba-stats-token": "true",
 }
 
-DEFAULT_TIMEOUT = 10
+DEFAULT_TIMEOUT = 30
+SLOW_ENDPOINT_TIMEOUTS: tuple[int, ...] = (
+    DEFAULT_TIMEOUT,
+    DEFAULT_TIMEOUT * 2,
+    DEFAULT_TIMEOUT * 4,
+    DEFAULT_TIMEOUT * 4,
+    DEFAULT_TIMEOUT * 4,
+)
+MAX_REQUEST_RETRIES = 5
+MAX_BACKOFF_SECONDS = 16
 
 
 @dataclass
@@ -165,14 +181,14 @@ def _fetch_season_frame(
     for season_type in SEASON_TYPES:
         frame = _call_with_retry(
             f"league game log {season} ({season_type})",
-            lambda st=season_type: leaguegamelog.LeagueGameLog(
+            lambda timeout, st=season_type: leaguegamelog.LeagueGameLog(
                 league_id="00",
                 season=season,
                 season_type_all_star=st,
                 date_from_nullable=from_str,
                 date_to_nullable=to_str,
                 headers=NBA_API_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
+                timeout=timeout,
             ).get_data_frames()[0],
         )
         if not frame.empty:
@@ -250,14 +266,32 @@ def _write_dataframe(path: Path, frame: pd.DataFrame, *, append: bool) -> int:
     return len(frame)
 
 
-def _call_with_retry(description: str, func: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+def _call_with_retry(
+    description: str,
+    func: Callable[[int | float | tuple[int, int]], pd.DataFrame],
+    *,
+    timeouts: Optional[Sequence[int | float | tuple[int, int]]] = None,
+) -> pd.DataFrame:
     last_error: Optional[Exception] = None
-    for attempt in range(3):
+    delay = 1
+    timeout_plan: Sequence[int | float | tuple[int, int]]
+    if timeouts is None:
+        timeout_plan = (DEFAULT_TIMEOUT,) * MAX_REQUEST_RETRIES
+    elif not timeouts:
+        timeout_plan = (DEFAULT_TIMEOUT,) * MAX_REQUEST_RETRIES
+    else:
+        timeout_plan = timeouts
+
+    for attempt in range(1, MAX_REQUEST_RETRIES + 1):
+        timeout_value = timeout_plan[min(attempt - 1, len(timeout_plan) - 1)]
         try:
-            return func()
+            return func(timeout_value)
         except requests_exceptions.RequestException as exc:  # pragma: no cover - network
             last_error = exc
-            time.sleep(2 ** attempt)
+            if attempt == MAX_REQUEST_RETRIES:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, MAX_BACKOFF_SECONDS)
     if last_error is not None:  # pragma: no cover - network
         raise RuntimeError(f"Failed to fetch {description}") from last_error
     raise RuntimeError(f"Failed to fetch {description}")
@@ -269,11 +303,12 @@ def _fetch_all_players() -> pd.DataFrame:
     for meta in players:
         frame = _call_with_retry(
             f"player {meta['id']}",
-            lambda meta_id=meta["id"]: commonplayerinfo.CommonPlayerInfo(
+            lambda timeout, meta_id=meta["id"]: commonplayerinfo.CommonPlayerInfo(
                 player_id=meta_id,
                 headers=NBA_API_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
+                timeout=timeout,
             ).get_data_frames()[0],
+            timeouts=SLOW_ENDPOINT_TIMEOUTS,
         )
         if not frame.empty:
             frames.append(frame)
@@ -288,11 +323,12 @@ def _fetch_all_teams() -> pd.DataFrame:
     for meta in teams:
         frame = _call_with_retry(
             f"team {meta['id']}",
-            lambda meta_id=meta["id"]: teaminfocommon.TeamInfoCommon(
+            lambda timeout, meta_id=meta["id"]: teaminfocommon.TeamInfoCommon(
                 team_id=meta_id,
                 headers=NBA_API_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
+                timeout=timeout,
             ).get_data_frames()[0],
+            timeouts=SLOW_ENDPOINT_TIMEOUTS,
         )
         if not frame.empty:
             frames.append(frame)
@@ -306,11 +342,12 @@ def _fetch_game_summaries(game_ids: Sequence[str]) -> pd.DataFrame:
     for game_id in game_ids:
         frame = _call_with_retry(
             f"game summary {game_id}",
-            lambda gid=game_id: boxscoresummaryv2.BoxScoreSummaryV2(
+            lambda timeout, gid=game_id: boxscoresummaryv2.BoxScoreSummaryV2(
                 game_id=gid,
                 headers=NBA_API_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
+                timeout=timeout,
             ).get_data_frames()[0],
+            timeouts=SLOW_ENDPOINT_TIMEOUTS,
         )
         if not frame.empty:
             frames.append(frame)
