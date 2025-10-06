@@ -1,9 +1,29 @@
+# Python
 __pycache__/
 *.py[cod]
-.env
+*.pyo
+*.pyd
+
+# Envs
 .venv/
-*.sqlite
+venv/
+.env
+
+# OS junk
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Data (Kaggle dumps, DBs, artifacts) — don't commit these
+data/
+!data/.gitkeep
+*.duckdb
 *.db
+*.sqlite
+*.parquet
+*.feather
 *.zip
 *.log
 nba-db/

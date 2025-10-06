@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+from pandas.tseries.offsets import MonthEnd
+from pandas import Timestamp
 from pathlib import Path
 from typing import Optional
 
@@ -168,5 +170,6 @@ def daily(
 
     return DailyUpdateResult(GAME_CSV, appended_rows, appended=True, final_row_count=final_count)
 
+    LOGGER.info(f"Daily update wrote {len(new_rows)} new rows to {GAME_CSV} (appended={appended})")
 
 __all__ = ["DailyUpdateResult", "daily"]

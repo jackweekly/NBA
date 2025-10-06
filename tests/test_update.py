@@ -4,6 +4,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
+from requests import exceptions as requests_exceptions
 
 from nba_db import paths, update
 
