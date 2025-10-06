@@ -186,3 +186,69 @@ def test_bootstrap_kaggle_dump_missing_cli(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         nbadb_sync.bootstrap_kaggle_dump(tmp_path / "dataset")
+
+
+def test_fetch_game_logs_for_date_uses_headers_and_timeout(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_leaguegamelog(*, league_id, season, season_type_all_star, date_from_nullable, date_to_nullable, headers, timeout):
+        calls.append(
+            {
+                "league_id": league_id,
+                "season": season,
+                "season_type": season_type_all_star,
+                "headers": headers,
+                "timeout": timeout,
+                "date_from": date_from_nullable,
+                "date_to": date_to_nullable,
+            }
+        )
+        return types.SimpleNamespace(
+            get_data_frames=lambda: [pd.DataFrame({"GAME_ID": ["1"], "SEASON_ID": ["1"]})]
+        )
+
+    monkeypatch.setattr(nbadb_sync.leaguegamelog, "LeagueGameLog", fake_leaguegamelog)
+
+    frame = nbadb_sync._fetch_game_logs_for_date(date(2024, 10, 5), retries=1)
+
+    assert not frame.empty
+    assert {call["season_type"] for call in calls} == set(nbadb_sync.SEASON_TYPES)
+    assert all(call["headers"] == nbadb_sync.NBA_API_HEADERS for call in calls)
+    assert all(call["timeout"] == nbadb_sync.DEFAULT_TIMEOUT for call in calls)
+
+
+def test_update_raw_data_defaults_to_today(monkeypatch, tmp_path):
+    class FakeDate(date):
+        @classmethod
+        def today(cls) -> "FakeDate":
+            return cls(2024, 10, 5)
+
+    processed: list[date] = []
+
+    def fake_fetch_game_logs(target_date: date) -> pd.DataFrame:
+        processed.append(target_date)
+        return pd.DataFrame(
+            {
+                "GAME_ID": [target_date.strftime("%Y%m%d")],
+                "TEAM_ID": ["1610612737"],
+                "GAME_DATE": [target_date.isoformat()],
+            }
+        )
+
+    manifest_path = tmp_path / nbadb_sync.MANIFEST_FILENAME
+    manifest_path.write_text(json.dumps({"last_updated": "2024-10-03"}))
+
+    monkeypatch.setattr(nbadb_sync, "date", FakeDate)
+    monkeypatch.setattr(nbadb_sync, "_fetch_game_logs_for_date", fake_fetch_game_logs)
+    monkeypatch.setattr(
+        nbadb_sync, "fetch_dataset_metadata", lambda session=None: {"title": "NBA Database"}
+    )
+
+    summary = nbadb_sync.update_raw_data(output_dir=tmp_path)
+
+    assert summary.processed_dates == [date(2024, 10, 4), date(2024, 10, 5)]
+    assert processed == summary.processed_dates
+    assert len(summary.downloaded_files) == 2
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["last_updated"] == "2024-10-05"
