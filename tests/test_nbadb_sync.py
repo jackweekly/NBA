@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 from datetime import date
 from pathlib import Path
 
@@ -142,3 +143,46 @@ def test_bootstrap_kaggle_imports_dataset(tmp_path, monkeypatch):
     assert manifest["last_updated"] == "2024-10-26"
     assert set(manifest["historical_seasons"]) >= {"2023-24", "2024-25"}
     assert manifest["bootstrap"]["dataset"] == nbadb_sync.KAGGLE_DATASET_ID
+
+
+def test_bootstrap_kaggle_dump_invokes_cli(tmp_path, monkeypatch):
+    commands: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_which(executable: str) -> str:
+        assert executable == "kaggle"
+        return "/usr/bin/kaggle"
+
+    def fake_run(args, *, check):
+        commands.append((tuple(args), check))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(nbadb_sync.shutil, "which", fake_which)
+    monkeypatch.setattr(nbadb_sync.subprocess, "run", fake_run)
+
+    destination = tmp_path / "dataset"
+    result = nbadb_sync.bootstrap_kaggle_dump(destination)
+
+    assert result == destination
+    assert destination.exists()
+    assert commands == [
+        (
+            (
+                "kaggle",
+                "datasets",
+                "download",
+                "--unzip",
+                "-p",
+                str(destination),
+                "-d",
+                nbadb_sync.KAGGLE_DATASET_ID,
+            ),
+            True,
+        )
+    ]
+
+
+def test_bootstrap_kaggle_dump_missing_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(nbadb_sync.shutil, "which", lambda executable: None)
+
+    with pytest.raises(FileNotFoundError):
+        nbadb_sync.bootstrap_kaggle_dump(tmp_path / "dataset")
