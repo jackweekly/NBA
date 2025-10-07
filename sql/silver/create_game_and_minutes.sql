@@ -1,11 +1,89 @@
--- Canonical game metadata: season_type, game_date, periods/OT, minutes targets
 CREATE SCHEMA IF NOT EXISTS silver;
 
--- bronze_game_norm was created by apply_schema.py, if not, switch to bronze_game + COALESCE derivation
+-- 1) Team-row home/away resolver (1 row per team per game)
+CREATE OR REPLACE VIEW silver.home_away_resolved AS
+WITH base_teams AS (
+  SELECT
+    game_id,
+    team_id_home AS team_id,
+    'home' AS side
+  FROM bronze_game_norm
+  UNION ALL
+  SELECT
+    game_id,
+    team_id_away AS team_id,
+    'away' AS side
+  FROM bronze_game_norm
+),
+overridden_teams AS (
+  SELECT
+    bt.game_id,
+    COALESCE(
+      CASE
+        WHEN hoa.home_override THEN CAST(hoa.team_id_home AS VARCHAR)
+        WHEN hoa.away_override THEN CAST(hoa.team_id_away AS VARCHAR)
+        ELSE NULL
+      END,
+      bt.team_id
+    ) AS team_id,
+    COALESCE(
+      CASE
+        WHEN hoa.home_override THEN 'home'
+        WHEN hoa.away_override THEN 'away'
+        ELSE NULL
+      END,
+      bt.side
+    ) AS side
+  FROM base_teams bt
+  LEFT JOIN silver.home_away_overrides hoa ON bt.game_id = hoa.game_id
+)
+SELECT * FROM overridden_teams WHERE team_id IS NOT NULL;
+
+-- 2) Team rows from bronze_box_score (unpivot home/away into rows; no minutes here)
+CREATE OR REPLACE VIEW silver.team_rows_from_game AS
+SELECT
+  game_id,
+  team_id_home      AS team_id,
+  team_abbreviation_home AS team_abbreviation,
+  'home'            AS side,
+  pts_ot1_home, pts_ot2_home, pts_ot3_home, pts_ot4_home, pts_ot5_home,
+  pts_ot6_home, pts_ot7_home, pts_ot8_home, pts_ot9_home, pts_ot10_home
+FROM bronze_box_score
+UNION ALL
+SELECT
+  game_id,
+  team_id_away      AS team_id,
+  team_abbreviation_away AS team_abbreviation,
+  'away'            AS side,
+  pts_ot1_away, pts_ot2_away, pts_ot3_away, pts_ot4_away, pts_ot5_away,
+  pts_ot6_away, pts_ot7_away, pts_ot8_away, pts_ot9_away, pts_ot10_away
+FROM bronze_box_score;
+
+-- 3) Team "minutes" placeholder (no player minutes available in this dataset)
+--    Keep the interface stable: expose (game_id, team_id, minutes_raw) so QC can skip NULLs.
+CREATE OR REPLACE VIEW silver.team_minutes_from_players AS
+SELECT
+  game_id,
+  team_id,
+  CAST(NULL AS DOUBLE) AS minutes_raw
+FROM silver.team_rows_from_game;
+
+CREATE OR REPLACE VIEW silver.team_minutes_from_teamline AS
+SELECT
+  game_id,
+  team_id,
+  CAST(NULL AS DOUBLE) AS minutes_raw
+FROM silver.team_rows_from_game;
+
+CREATE OR REPLACE VIEW silver.team_minutes AS
+SELECT * FROM silver.team_minutes_from_players;  -- single source, NULL minutes (safe)
+
+-- 4) Game-level enrichment with **OT inference from OT points columns**
+--    Target minutes are TEAM TOTAL player-minutes: 240 + 25 * OT
 CREATE OR REPLACE VIEW silver.game_enriched AS
 WITH base AS (
   SELECT
-    g.game_id,
+    CAST(g.game_id AS BIGINT) AS game_id,
     CAST(g.game_date AS DATE) AS game_date,
     COALESCE(
       g.season_type,
@@ -15,58 +93,32 @@ WITH base AS (
         WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 4 THEN 'Playoffs'
         ELSE NULL
       END
-    ) AS season_type,
-    4 AS regulation_periods,
-    CAST(NULL AS INTEGER) AS ot_periods_raw
+    ) AS season_type
   FROM bronze_game_norm AS g
 ),
-tm AS (
-  -- average per-team minutes actually observed (sum of player minutes)
-  SELECT game_id, AVG(minutes_raw) AS avg_minutes_per_team
-  FROM silver.team_minutes
-  GROUP BY 1
-),
-ot_infer AS (
-  -- infer OT periods if raw is missing; each OT adds +25 team minutes (5 players × 5 minutes)
+ot_from_pts AS (
   SELECT
-    b.game_id,
-    CASE
-      WHEN tm.avg_minutes_per_team IS NULL THEN NULL
-      WHEN tm.avg_minutes_per_team <= 240 + 1 THEN 0
-      ELSE ROUND( (tm.avg_minutes_per_team - 240) / 25.0 )
-    END AS ot_periods_inferred
-  FROM base b
-  LEFT JOIN tm USING (game_id)
+    game_id,
+    /* Count how many OT frames have any non-null value on either side */
+    CAST( (pts_ot1_home  IS NOT NULL OR pts_ot1_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot2_home  IS NOT NULL OR pts_ot2_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot3_home  IS NOT NULL OR pts_ot3_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot4_home  IS NOT NULL OR pts_ot4_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot5_home  IS NOT NULL OR pts_ot5_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot6_home  IS NOT NULL OR pts_ot6_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot7_home  IS NOT NULL OR pts_ot7_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot8_home  IS NOT NULL OR pts_ot8_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot9_home  IS NOT NULL OR pts_ot9_away  IS NOT NULL) AS INTEGER) +
+    CAST( (pts_ot10_home IS NOT NULL OR pts_ot10_away IS NOT NULL) AS INTEGER) AS ot_periods
+  FROM bronze_box_score
 )
 SELECT
   b.game_id,
   b.game_date,
   b.season_type,
-  b.regulation_periods,
-  COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0)                           AS ot_periods,
-  (b.regulation_periods * 12 * 5)                                                 AS regulation_minutes_per_team, -- 48*5 = 240
-  (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 25)                     AS ot_minutes_per_team,         -- each OT adds 25
-  ((b.regulation_periods * 12 * 5) + (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 25)) AS target_minutes_per_team
+  COALESCE(o.ot_periods, 0) AS ot_periods,
+  240 AS regulation_minutes_per_team,
+  COALESCE(o.ot_periods,0)*25 AS ot_minutes_per_team,
+  240 + COALESCE(o.ot_periods,0)*25 AS target_minutes_per_team
 FROM base b
-LEFT JOIN ot_infer o USING (game_id);
-
--- Team minutes from bronze_game
-CREATE OR REPLACE VIEW silver.team_minutes AS
-SELECT
-  game_id,
-  team_id,
-  CASE
-    WHEN typeof(min) IN ('DOUBLE', 'DECIMAL', 'BIGINT', 'INTEGER') THEN CAST(min AS DOUBLE)
-    WHEN CAST(min AS VARCHAR) ~ '^[0-9]+:[0-9]{2}$' THEN
-         CAST(SPLIT_PART(CAST(min AS VARCHAR), ':', 1) AS DOUBLE) + CAST(SPLIT_PART(CAST(min AS VARCHAR), ':', 2) AS DOUBLE)/60.0
-    ELSE NULL
-  END AS minutes_raw
-FROM bronze_game_norm;
-
--- Final resolved home/away (from overrides already written earlier)
-CREATE OR REPLACE VIEW silver.home_away_resolved AS
-SELECT
-  o.game_id,
-  o.team_id_home,
-  o.team_id_away
-FROM silver.home_away_overrides o;
+LEFT JOIN ot_from_pts o USING (game_id);

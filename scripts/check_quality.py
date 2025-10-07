@@ -8,30 +8,32 @@ def main():
 
     # minutes comparison
     q = """
-      WITH games AS (
-        SELECT DISTINCT game_id FROM bronze_game_norm
-      ),
-      joined AS (
-        SELECT
-          tm.game_id,
-          tm.team_id,
-          ge.game_date,
-          ge.season_type,
-          tm.minutes_raw,
-          ge.target_minutes_per_team AS minutes_target
-        FROM silver.team_minutes tm
-        JOIN games g USING (game_id)
-        JOIN silver.game_enriched ge USING (game_id)
-      )
-      SELECT
-        game_id, team_id, season_type, game_date,
-        minutes_raw, minutes_target,
-        CASE WHEN minutes_target IS NOT NULL AND ABS(minutes_raw - minutes_target) > 1.0
-             THEN TRUE ELSE FALSE END AS min_bad
-      FROM joined
-      ORDER BY game_date DESC
-      LIMIT 20000
-    """
+  WITH games AS (SELECT DISTINCT game_id FROM bronze_game_norm),
+  joined AS (
+    SELECT
+      tm.game_id,
+      tm.team_id,
+      ge.game_date,
+      ge.season_type,
+      tm.minutes_raw,
+      ge.target_minutes_per_team AS minutes_target
+    FROM silver.team_minutes tm
+    JOIN games g USING (game_id)
+    JOIN silver.game_enriched ge USING (game_id)
+  )
+  SELECT
+    game_id, team_id, season_type, game_date,
+    minutes_raw, minutes_target,
+    CASE
+      WHEN minutes_raw IS NULL THEN FALSE            -- <-- skip minute check if we don't have minutes
+      WHEN minutes_target IS NULL THEN FALSE
+      WHEN ABS(minutes_raw - minutes_target) > 1.0 THEN TRUE
+      ELSE FALSE
+    END AS min_bad
+  FROM joined
+  ORDER BY game_date DESC
+  LIMIT 20000
+"""
     rows = con.execute(q).fetchall()
 
     bad = [r for r in rows if r[-1] and r[3] >= date.fromisoformat(LEGACY_CUTOFF_DATE)]

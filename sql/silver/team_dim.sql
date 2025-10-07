@@ -15,7 +15,23 @@ observed_modern AS (
     NULLIF(TRIM(team_name), '') AS team_name,
     'NBA' AS league,
     1 AS priority
-  FROM bronze_game_norm
+  FROM (
+    SELECT
+      team_id_home AS team_id,
+      team_abbreviation_home AS team_abbreviation,
+      team_name_home AS team_name,
+      game_date,
+      season_id
+    FROM bronze_game_norm
+    UNION ALL
+    SELECT
+      team_id_away AS team_id,
+      team_abbreviation_away AS team_abbreviation,
+      team_name_away AS team_name,
+      game_date,
+      season_id
+    FROM bronze_game_norm
+  ) AS unpivoted_teams
   WHERE team_id IS NOT NULL
     AND (
       CASE

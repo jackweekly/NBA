@@ -21,7 +21,7 @@ SQLITE_TABLE_MAP: dict[str, str] = {
     "team": "bronze_team",
     "player": "bronze_player",
     "line_score": "bronze_box_score_team",
-    "box_score": "bronze_box_score_team",
+    "box_score": "bronze_box_score", # Changed to bronze_box_score
     "play_by_play": "bronze_play_by_play",
 }
 
@@ -48,74 +48,51 @@ def _coalesce_sqlite_tables(connection: duckdb.DuckDBPyConnection) -> dict[str, 
             mapping[target] = f"SELECT * FROM seed.main.{source_name}"
     return mapping
 
+def _merge_csv(con, table_name, csv_path, pks):
+    if not csv_path.exists():
+        LOGGER.warning(f"CSV file {csv_path} not found, skipping merge for {table_name}.")
+        return
 
-def _load_csv_tables(connection: duckdb.DuckDBPyConnection, csv_paths: Iterable[Path]) -> None:
-    # This mapping is based on the user's instructions and file names
-    table_file_map = {
-        "bronze_game": "game.csv",
-        "bronze_box_score_team": "box_score.csv",
-        "bronze_player": "player.csv",
-        "bronze_team": "team.csv",
-        "bronze_play_by_play": "play_by_play.csv",
-    }
+    LOGGER.info("Merging CSV %s -> %s", csv_path, table_name)
     
-    pk_map = {
-        "bronze_game": ["game_id"],
-        "bronze_box_score_team": ["game_id", "team_id"],
-        "bronze_player": ["player_id"],
-        "bronze_team": ["team_id"],
-    }
+    temp_table_name = f"{table_name}_csv"
+    con.execute(f"""
+      CREATE OR REPLACE TEMP TABLE {temp_table_name} AS
+      SELECT * FROM read_csv_auto(?, IGNORE_ERRORS=true)
+    """, [str(csv_path)])
 
-    for table_name, file_name in table_file_map.items():
-        # Find the full path for the file
-        csv_path = next((p for p in csv_paths if p.name == file_name), None)
-        if not csv_path:
-            LOGGER.warning(f"CSV file {file_name} not found, skipping merge for {table_name}.")
-            continue
+    con.execute(f"""
+      CREATE TABLE IF NOT EXISTS {table_name} AS
+      SELECT * FROM {temp_table_name} WHERE 1=0
+    """)
+    
+    temp_cols = {c[0].lower() for c in con.execute(f"DESCRIBE {temp_table_name}").fetchall()}
+    if pks and not all(pk.lower() in temp_cols for pk in pks):
+        pks = None 
+        LOGGER.warning(f"Not all PKs for {table_name} found in {csv_path}. Will dedupe on all columns.")
 
-        LOGGER.info("Merging CSV %s -> %s", csv_path, table_name)
-        
-        temp_table_name = f"{table_name}_csv"
-        connection.execute(f"""
-          CREATE OR REPLACE TEMP TABLE {temp_table_name} AS
-          SELECT * FROM read_csv_auto(?, IGNORE_ERRORS=true)
-        """, [csv_path.as_posix()])
-
-        connection.execute(f"""
-          CREATE TABLE IF NOT EXISTS {table_name} AS
-          SELECT * FROM {temp_table_name} WHERE 1=0
+    if pks:
+        on_clause = " AND ".join([f"t.{pk} = s.{pk}" for pk in pks])
+        con.execute(f"""
+          MERGE INTO {table_name} t
+          USING {temp_table_name} s
+          ON {on_clause}
+          WHEN NOT MATCHED THEN INSERT *
         """)
         
-        pks = pk_map.get(table_name)
-        
-        temp_cols = {c[0].lower() for c in connection.execute(f"DESCRIBE {temp_table_name}").fetchall()}
-        if pks and not all(pk.lower() in temp_cols for pk in pks):
-            pks = None 
-            LOGGER.warning(f"Not all PKs for {table_name} found in {csv_path}. Will dedupe on all columns.")
-
-        if pks:
-            on_clause = " AND ".join([f"t.{pk} = s.{pk}" for pk in pks])
-            connection.execute(f"""
-              MERGE INTO {table_name} t
-              USING {temp_table_name} s
-              ON {on_clause}
-              WHEN NOT MATCHED THEN INSERT *
-            """)
-            
-            partition_by = ", ".join(pks)
-            connection.execute(f"""
-              CREATE OR REPLACE TABLE {table_name} AS
-              SELECT * EXCLUDE rn
-              FROM (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY 1) AS rn
-                FROM {table_name}
-              )
-              WHERE rn = 1
-            """)
-        else: # For play_by_play or if PKs are missing
-            connection.execute(f"INSERT INTO {table_name} SELECT * FROM {temp_table_name}")
-            connection.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT DISTINCT * FROM {table_name}")
-
+        partition_by = ", ".join(pks)
+        con.execute(f"""
+          CREATE OR REPLACE TABLE {table_name} AS
+          SELECT * EXCLUDE rn
+          FROM (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY 1) AS rn
+            FROM {table_name}
+          )
+          WHERE rn = 1
+        """)
+    else:
+        con.execute(f"INSERT INTO {table_name} SELECT * FROM {temp_table_name}")
+        con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT DISTINCT * FROM {table_name}")
 
 def seed_duckdb(
     *,
@@ -133,7 +110,6 @@ def seed_duckdb(
         sqlite_source = sqlite_candidates[0] if sqlite_candidates else None
 
     bootstrap_root = bootstrap_dir or RAW_BOOTSTRAP_DIR
-    game_csv = game_log_csv or GAME_CSV
 
     database.parent.mkdir(parents=True, exist_ok=True)
 
@@ -142,13 +118,6 @@ def seed_duckdb(
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
     con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold;")
-
-    schema_sql_path = Path(__file__).resolve().parents[2] / "scripts" / "create_schemas.sql"
-    if schema_sql_path.exists():
-        LOGGER.debug("Ensuring medallion schemas via %s", schema_sql_path)
-        con.execute(schema_sql_path.read_text())
-    else:
-        LOGGER.warning("Schema bootstrap file missing at %s", schema_sql_path)
 
     if sqlite_source and sqlite_source.exists():
         LOGGER.info("Attaching Kaggle SQLite %s", sqlite_source)
@@ -161,31 +130,12 @@ def seed_duckdb(
     else:
         LOGGER.info("No Kaggle SQLite source found; skipping ATTACH step")
 
-    csv_sources: list[Path] = []
-    if bootstrap_root and bootstrap_root.exists():
-        csv_sources.extend(sorted(bootstrap_root.glob("*.csv")))
-    if game_csv and game_csv.exists():
-        csv_sources.append(game_csv)
-
-    seen: set[Path] = set()
-    ordered_sources: list[Path] = []
-    for path in csv_sources:
-        if path not in seen:
-            ordered_sources.append(path)
-            seen.add(path)
-
-    _load_csv_tables(con, ordered_sources)
-
-    tables = {name for (name,) in con.execute(
-        "SELECT table_name FROM duckdb_tables() WHERE database_name IS NULL AND schema_name = 'main'"
-    ).fetchall()}
-
-    if 'bronze_game_log_team' not in tables:
-        if 'bronze_game' in tables:
-            LOGGER.info('Creating bronze_game_log_team from bronze_game')
-            con.execute('CREATE OR REPLACE TABLE bronze_game_log_team AS SELECT * FROM bronze_game')
-        else:
-            con.execute('CREATE TABLE IF NOT EXISTS bronze_game_log_team (game_id VARCHAR, team_id VARCHAR)')
+    _merge_csv(con, "bronze_box_score", bootstrap_root / "box_score.csv", ["game_id", "team_id", "player_id"])
+    _merge_csv(con, "bronze_box_score_team", bootstrap_root / "line_score.csv", ["game_id", "team_id"])
+    _merge_csv(con, "bronze_game", bootstrap_root / "game.csv", ["game_id"])
+    _merge_csv(con, "bronze_player", bootstrap_root / "player.csv", ["player_id"])
+    _merge_csv(con, "bronze_team", bootstrap_root / "team.csv", ["team_id"])
+    _merge_csv(con, "bronze_play_by_play", bootstrap_root / "play_by_play.csv", None) # No PK
 
     con.close()
     LOGGER.info("Seeded DuckDB at %s", database)
