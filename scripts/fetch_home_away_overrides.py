@@ -8,7 +8,8 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from datetime import date, datetime
+from typing import Iterable, Sequence
 
 import duckdb
 import requests
@@ -32,24 +33,48 @@ MAX_WORKERS = 4
 
 
 @dataclass
-class OverrideRecord:
-    """Represent a resolved home/away mapping for a single team."""
+class GameOverride:
+    """Resolved home/away mapping for a single game."""
 
-    game_id: str
-    team_id: str
-    is_home: bool
+    game_id: int
+    event_date: date | None
+    season: int | None
+    team_id_home: int
+    team_id_away: int
 
 
 def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver")
+    expected_cols = {
+        "game_id",
+        "date",
+        "season",
+        "team_id_home",
+        "team_id_away",
+        "home_override",
+        "away_override",
+        "source",
+        "updated_at",
+    }
+    existing_info = con.execute("PRAGMA table_info('silver.home_away_overrides')").fetchall()
+    existing_cols = {row[1] for row in existing_info}
+    if existing_cols and not expected_cols.issubset(existing_cols):
+        logging.info("Dropping legacy silver.home_away_overrides table to apply new schema")
+        con.execute("DROP TABLE silver.home_away_overrides")
     con.execute(
         """
-        CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
-          game_id VARCHAR,
-          team_id VARCHAR,
-          is_home BOOLEAN,
-          PRIMARY KEY (game_id, team_id)
-        )
-        """
+    CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
+        game_id          BIGINT PRIMARY KEY,
+        date             DATE,
+        season           INTEGER,
+        team_id_home     INTEGER,
+        team_id_away     INTEGER,
+        home_override    BOOLEAN,
+        away_override    BOOLEAN,
+        source           VARCHAR,
+        updated_at       TIMESTAMP DEFAULT NOW()
+    )
+    """
     )
 
 
@@ -69,7 +94,7 @@ def _discover_from_bronze(con: duckdb.DuckDBPyConnection) -> list[str]:
         SELECT b.game_id
         FROM base b
         LEFT JOIN (
-          SELECT DISTINCT game_id
+          SELECT DISTINCT LPAD(CAST(game_id AS VARCHAR), 10, '0') AS game_id
           FROM silver.home_away_overrides
         ) o ON o.game_id = b.game_id
         WHERE o.game_id IS NULL
@@ -89,7 +114,7 @@ def _discover_games(con: duckdb.DuckDBPyConnection, explicit: Sequence[str]) -> 
     return _discover_from_bronze(con)
 
 
-def _fetch_single(game_id: str) -> list[OverrideRecord]:
+def _fetch_single(game_id: str) -> GameOverride:
     params = {"GameID": game_id}
     attempt = 0
     while True:
@@ -129,14 +154,37 @@ def _fetch_single(game_id: str) -> list[OverrideRecord]:
         if home_team is None or away_team is None:
             raise RuntimeError(f"Incomplete team IDs for {game_id}")
 
-        return [
-            OverrideRecord(game_id=game_id, team_id=str(home_team), is_home=True),
-            OverrideRecord(game_id=game_id, team_id=str(away_team), is_home=False),
-        ]
+        season = None
+        if "SEASON" in headers:
+            try:
+                season_raw = row[headers.index("SEASON")]
+                season = int(season_raw) if season_raw is not None else None
+            except (ValueError, TypeError):
+                season = None
+
+        event_date: date | None = None
+        if "GAME_DATE_EST" in headers:
+            raw_date = row[headers.index("GAME_DATE_EST")]
+            if raw_date:
+                try:
+                    event_date = datetime.fromisoformat(str(raw_date).replace("Z", "")).date()
+                except ValueError:
+                    try:
+                        event_date = datetime.strptime(str(raw_date), "%Y-%m-%d").date()
+                    except ValueError:
+                        event_date = None
+
+        return GameOverride(
+            game_id=int(game_id),
+            event_date=event_date,
+            season=season,
+            team_id_home=int(home_team),
+            team_id_away=int(away_team),
+        )
 
 
-def _fetch_overrides(game_ids: Sequence[str]) -> tuple[list[OverrideRecord], list[str]]:
-    overrides: list[OverrideRecord] = []
+def _fetch_overrides(game_ids: Sequence[str]) -> tuple[list[GameOverride], list[str]]:
+    overrides: list[GameOverride] = []
     failures: list[str] = []
     if not game_ids:
         return overrides, failures
@@ -149,25 +197,34 @@ def _fetch_overrides(game_ids: Sequence[str]) -> tuple[list[OverrideRecord], lis
         for future in concurrent.futures.as_completed(future_by_id):
             game_id = future_by_id[future]
             try:
-                overrides.extend(future.result())
+                overrides.append(future.result())
             except Exception as exc:  # pragma: no cover - network failure path
                 logging.error("Failed to resolve %s: %s", game_id, exc)
                 failures.append(game_id)
     return overrides, failures
 
 
-def _prepare_override_rows(records: Iterable[OverrideRecord]) -> list[tuple[str, str, bool]]:
-    rows: list[tuple[str, str, bool]] = []
+def _prepare_override_rows(records: Iterable[GameOverride]) -> list[tuple[int, date | None, int | None, int, int, bool, bool, str]]:
+    rows: list[tuple[int, date | None, int | None, int, int, bool, bool, str]] = []
     for record in records:
-        game_id = record.game_id.zfill(10)
-        team_id = record.team_id.strip()
-        rows.append((game_id, team_id, record.is_home))
+        rows.append(
+            (
+                record.game_id,
+                record.event_date,
+                record.season,
+                record.team_id_home,
+                record.team_id_away,
+                True,
+                True,
+                "nba_api_boxscoresummaryv2",
+            )
+        )
     return rows
 
 
 def _store_overrides(
     con: duckdb.DuckDBPyConnection,
-    rows: Sequence[tuple[str, str, bool]],
+    rows: Sequence[tuple[int, date | None, int | None, int, int, bool, bool, str]],
     dry_run: bool,
 ) -> None:
     if not rows:
@@ -177,12 +234,44 @@ def _store_overrides(
     logging.info("Updating overrides for %s games", len(game_ids))
 
     if dry_run:
-        for game_id, team_id, is_home in rows:
-            logging.info("DRY RUN: would set %s → %s home=%s", game_id, team_id, is_home)
+        for (
+            game_id,
+            event_date,
+            season,
+            team_id_home,
+            team_id_away,
+            home_override,
+            away_override,
+            source,
+        ) in rows:
+            logging.info(
+                "DRY RUN: would upsert %s → home=%s (override=%s) away=%s (override=%s) date=%s season=%s source=%s",
+                str(game_id).zfill(10),
+                team_id_home,
+                home_override,
+                team_id_away,
+                away_override,
+                event_date,
+                season,
+                source,
+            )
         return
 
     delete_sql = "DELETE FROM silver.home_away_overrides WHERE game_id = ?"
-    insert_sql = "INSERT OR REPLACE INTO silver.home_away_overrides (game_id, team_id, is_home) VALUES (?, ?, ?)"
+    insert_sql = (
+        """
+        INSERT OR REPLACE INTO silver.home_away_overrides (
+            game_id,
+            date,
+            season,
+            team_id_home,
+            team_id_away,
+            home_override,
+            away_override,
+            source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+    )
 
     con.execute("BEGIN TRANSACTION")
     try:
@@ -240,7 +329,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if failures:
         logging.warning("Failed to resolve %s game(s): %s", len(failures), ", ".join(failures))
 
-    logging.info("Stored overrides for %s team rows", len(rows))
+    if args.dry_run:
+        logging.info("Dry run evaluated %s game overrides", len(rows))
+    else:
+        logging.info("Stored overrides for %s game overrides", len(rows))
     return 1 if failures and not args.dry_run else 0
 
 

@@ -89,10 +89,17 @@ with_home AS (
 overridden AS (
   SELECT
     wh.*,
-    COALESCE(hoa.is_home, wh.is_home_inferred) AS is_home
+    COALESCE(
+      CASE
+        WHEN hoa.home_override AND TRY_CAST(wh.team_id AS BIGINT) = hoa.team_id_home THEN TRUE
+        WHEN hoa.away_override AND TRY_CAST(wh.team_id AS BIGINT) = hoa.team_id_away THEN FALSE
+        ELSE NULL
+      END,
+      wh.is_home_inferred
+    ) AS is_home
   FROM with_home wh
   LEFT JOIN silver.home_away_overrides hoa
-    ON hoa.game_id = wh.game_id AND hoa.team_id = wh.team_id
+    ON hoa.game_id = TRY_CAST(wh.game_id AS BIGINT)
 ),
 with_stats AS (
   SELECT

@@ -87,6 +87,13 @@ def seed_duckdb(
     con = duckdb.connect(str(database))
     con.execute("PRAGMA threads=4;")
 
+    schema_sql_path = Path(__file__).resolve().parents[2] / "scripts" / "create_schemas.sql"
+    if schema_sql_path.exists():
+        LOGGER.debug("Ensuring medallion schemas via %s", schema_sql_path)
+        con.execute(schema_sql_path.read_text())
+    else:
+        LOGGER.warning("Schema bootstrap file missing at %s", schema_sql_path)
+
     if sqlite_source and sqlite_source.exists():
         LOGGER.info("Attaching Kaggle SQLite %s", sqlite_source)
         con.execute(f"ATTACH '{sqlite_source.as_posix()}' AS seed (TYPE SQLITE)")
