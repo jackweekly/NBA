@@ -18,14 +18,13 @@ def main() -> int:
     con = duckdb.connect(DB_PATH, read_only=True)
 
     con.execute(
-        """
+        f"""
         CREATE OR REPLACE TEMP VIEW v_modern AS
         SELECT sgc.*, h.start_year
         FROM silver.team_game_cov AS sgc
         JOIN helper.helper_season_year AS h USING (season_id)
-        WHERE h.start_year IS NOT NULL AND h.start_year >= ?
-        """,
-        [MODERN_START_YEAR],
+        WHERE h.start_year IS NOT NULL AND h.start_year >= {MODERN_START_YEAR}
+        """
     )
 
     failures: list[str] = []
