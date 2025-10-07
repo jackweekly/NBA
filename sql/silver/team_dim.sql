@@ -15,7 +15,7 @@ observed_modern AS (
     NULLIF(TRIM(team_name), '') AS team_name,
     'NBA' AS league,
     1 AS priority
-  FROM bronze_game_log_team
+  FROM bronze_game_norm
   WHERE team_id IS NOT NULL
     AND (
       CASE

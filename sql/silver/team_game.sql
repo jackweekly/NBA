@@ -31,7 +31,7 @@ WITH gl_raw AS (
     TRY_CAST(NULLIF(CAST(ft_pct    AS VARCHAR), '') AS DOUBLE) AS ft_pct_raw,
     TRY_CAST(NULLIF(CAST(plus_minus AS VARCHAR), '') AS DOUBLE) AS plus_minus,
     TRY_CAST(NULLIF(CAST(video_available AS VARCHAR), '') AS BOOLEAN) AS video_available
-  FROM bronze_game_log_team
+  FROM bronze_game_norm
   WHERE team_id IS NOT NULL
 ),
 canon AS (
