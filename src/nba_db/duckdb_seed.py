@@ -86,6 +86,7 @@ def seed_duckdb(
 
     con = duckdb.connect(str(database))
     con.execute("PRAGMA threads=4;")
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
 
     schema_sql_path = Path(__file__).resolve().parents[2] / "scripts" / "create_schemas.sql"
     if schema_sql_path.exists():

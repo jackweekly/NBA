@@ -32,6 +32,33 @@ BACKOFF_SECONDS = 1.5
 MAX_WORKERS = 4
 
 
+def _ensure_schemas(con: duckdb.DuckDBPyConnection) -> None:
+    """Ensure required schemas exist before interacting with tables."""
+
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver")
+
+
+def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the overrides table when missing."""
+
+    _ensure_schemas(con)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
+            game_id        BIGINT PRIMARY KEY,
+            date           DATE,
+            season         INTEGER,
+            team_id_home   INTEGER,
+            team_id_away   INTEGER,
+            home_override  BOOLEAN,
+            away_override  BOOLEAN,
+            source         VARCHAR,
+            updated_at     TIMESTAMP DEFAULT now()
+        )
+        """
+    )
+
+
 @dataclass
 class GameOverride:
     """Resolved home/away mapping for a single game."""
@@ -41,41 +68,6 @@ class GameOverride:
     season: int | None
     team_id_home: int
     team_id_away: int
-
-
-def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute("CREATE SCHEMA IF NOT EXISTS silver")
-    expected_cols = {
-        "game_id",
-        "date",
-        "season",
-        "team_id_home",
-        "team_id_away",
-        "home_override",
-        "away_override",
-        "source",
-        "updated_at",
-    }
-    existing_info = con.execute("PRAGMA table_info('silver.home_away_overrides')").fetchall()
-    existing_cols = {row[1] for row in existing_info}
-    if existing_cols and not expected_cols.issubset(existing_cols):
-        logging.info("Dropping legacy silver.home_away_overrides table to apply new schema")
-        con.execute("DROP TABLE silver.home_away_overrides")
-    con.execute(
-        """
-    CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
-        game_id          BIGINT PRIMARY KEY,
-        date             DATE,
-        season           INTEGER,
-        team_id_home     INTEGER,
-        team_id_away     INTEGER,
-        home_override    BOOLEAN,
-        away_override    BOOLEAN,
-        source           VARCHAR,
-        updated_at       TIMESTAMP DEFAULT NOW()
-    )
-    """
-    )
 
 
 def _discover_from_bronze(con: duckdb.DuckDBPyConnection) -> list[str]:
@@ -227,10 +219,11 @@ def _store_overrides(
     rows: Sequence[tuple[int, date | None, int | None, int, int, bool, bool, str]],
     dry_run: bool,
 ) -> None:
-    if not rows:
+    row_list = list(rows)
+    if not row_list:
         return
 
-    game_ids = sorted({row[0] for row in rows})
+    game_ids = sorted({row[0] for row in row_list})
     logging.info("Updating overrides for %s games", len(game_ids))
 
     if dry_run:
@@ -243,7 +236,7 @@ def _store_overrides(
             home_override,
             away_override,
             source,
-        ) in rows:
+        ) in row_list:
             logging.info(
                 "DRY RUN: would upsert %s → home=%s (override=%s) away=%s (override=%s) date=%s season=%s source=%s",
                 str(game_id).zfill(10),
@@ -257,10 +250,12 @@ def _store_overrides(
             )
         return
 
-    delete_sql = "DELETE FROM silver.home_away_overrides WHERE game_id = ?"
-    insert_sql = (
-        """
-        INSERT OR REPLACE INTO silver.home_away_overrides (
+    placeholders_per_row = "(" + ", ".join("?" for _ in row_list[0]) + ")"
+    placeholders = ", ".join([placeholders_per_row] * len(row_list))
+    temp_table_sql = f"""
+        CREATE OR REPLACE TEMP TABLE temp_overrides AS
+        SELECT * FROM (VALUES {placeholders})
+        AS temp (
             game_id,
             date,
             season,
@@ -269,17 +264,47 @@ def _store_overrides(
             home_override,
             away_override,
             source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """
-    )
+        )
+    """
+    flattened_params = [value for row in row_list for value in row]
+    con.execute(temp_table_sql, flattened_params)
 
-    con.execute("BEGIN TRANSACTION")
-    try:
-        for game_id in game_ids:
-            con.execute(delete_sql, [game_id])
-        con.executemany(insert_sql, rows)
-    finally:  # Ensure transaction closes even on failure
-        con.execute("COMMIT")
+    merge_sql = """
+        MERGE INTO silver.home_away_overrides AS t
+        USING temp_overrides AS s
+        ON t.game_id = s.game_id
+        WHEN MATCHED THEN UPDATE SET
+            date = s.date,
+            season = s.season,
+            team_id_home = s.team_id_home,
+            team_id_away = s.team_id_away,
+            home_override = s.home_override,
+            away_override = s.away_override,
+            source = s.source,
+            updated_at = now()
+        WHEN NOT MATCHED THEN INSERT (
+            game_id,
+            date,
+            season,
+            team_id_home,
+            team_id_away,
+            home_override,
+            away_override,
+            source,
+            updated_at
+        ) VALUES (
+            s.game_id,
+            s.date,
+            s.season,
+            s.team_id_home,
+            s.team_id_away,
+            s.home_override,
+            s.away_override,
+            s.source,
+            now()
+        )
+    """
+    con.execute(merge_sql)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
