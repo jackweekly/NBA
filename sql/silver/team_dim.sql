@@ -1,52 +1,53 @@
 CREATE OR REPLACE VIEW silver.team_dim AS
-WITH bronze AS (
-  SELECT
+WITH base AS (
+  SELECT DISTINCT
     CAST(id AS VARCHAR) AS team_id,
     NULLIF(TRIM(abbreviation), '') AS team_abbreviation,
     NULLIF(TRIM(nickname), '') AS team_name,
     'NBA' AS league,
-    1 AS priority
+    2 AS priority
   FROM bronze_team
 ),
-gl_teams AS (
+observed_modern AS (
   SELECT DISTINCT
     CAST(team_id AS VARCHAR) AS team_id,
     NULLIF(TRIM(team_abbreviation), '') AS team_abbreviation,
     NULLIF(TRIM(team_name), '') AS team_name,
     'NBA' AS league,
-    2 AS priority
+    1 AS priority
   FROM bronze_game_log_team
   WHERE team_id IS NOT NULL
+    AND (
+      CASE
+        WHEN game_date IS NOT NULL THEN
+          CASE
+            WHEN EXTRACT(MONTH FROM game_date) >= 8 THEN EXTRACT(YEAR FROM game_date)
+            ELSE EXTRACT(YEAR FROM game_date) - 1
+          END
+        ELSE TRY_CAST(SUBSTR(CAST(season_id AS VARCHAR), 1, 4) AS INT)
+      END
+    ) >= 2010
 ),
-bx_teams AS (
-  SELECT DISTINCT
-    CAST(team_id AS VARCHAR) AS team_id,
-    NULLIF(TRIM(bx_team_abbreviation), '') AS team_abbreviation,
-    NULLIF(TRIM(bx_team_nickname), '') AS team_name,
-    'NBA' AS league,
-    3 AS priority
-  FROM silver.box_score_team_norm
-  WHERE team_id IS NOT NULL
-),
-extras AS (
+allstar AS (
   SELECT * FROM (
     VALUES
       ('1610616833', 'EST', 'East All-Stars (NBA)', 'NBA', 0),
       ('1610616834', 'WST', 'West All-Stars (NBA)', 'NBA', 0)
   ) AS v(team_id, team_abbreviation, team_name, league, priority)
+),
+rolled AS (
+  SELECT * FROM allstar
+  UNION ALL SELECT * FROM observed_modern
+  UNION ALL SELECT * FROM base
 )
 SELECT team_id, team_abbreviation, team_name, league
 FROM (
-  SELECT *,
-         ROW_NUMBER() OVER (
-           PARTITION BY team_id
-           ORDER BY priority, team_name IS NULL, team_abbreviation IS NULL
-         ) AS rn
-  FROM (
-    SELECT * FROM extras
-    UNION ALL SELECT * FROM bronze
-    UNION ALL SELECT * FROM gl_teams
-    UNION ALL SELECT * FROM bx_teams
-  )
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY team_id
+      ORDER BY priority, team_abbreviation IS NULL, team_name IS NULL
+    ) AS rn
+  FROM rolled
 ) ranked
 WHERE rn = 1 AND team_id IS NOT NULL;

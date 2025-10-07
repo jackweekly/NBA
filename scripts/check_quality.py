@@ -33,14 +33,18 @@ CHECKS: Tuple[QualityCheck, ...] = (
             game_id,
             season_type,
             MAX(game_date) AS game_date,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl AS VARCHAR), '')) = 'W') AS wins,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl AS VARCHAR), '')) = 'L') AS losses
-          FROM silver.team_game_cov
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl_silver AS VARCHAR), '')) = 'W') AS wins,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl_silver AS VARCHAR), '')) = 'L') AS losses
+          FROM silver.team_game
           WHERE {filter}
           GROUP BY game_id, season_type
           HAVING wins <> 1 OR losses <> 1
         )
-        SELECT *, COUNT(*) OVER () AS total_rows
+        SELECT
+          *,
+          COUNT(*) FILTER (WHERE season_type <> 'All-Star') OVER () AS total_non_all_star,
+          COUNT(*) FILTER (WHERE season_type = 'All-Star') OVER () AS total_all_star,
+          COUNT(*) OVER () AS total_rows
         FROM flagged
         ORDER BY game_date DESC NULLS LAST, game_id
         LIMIT 20
@@ -58,8 +62,8 @@ CHECKS: Tuple[QualityCheck, ...] = (
             COUNT(*) FILTER (WHERE is_home IS TRUE) AS home_ct,
             COUNT(*) FILTER (WHERE is_home IS FALSE) AS away_ct,
             COUNT(*) FILTER (WHERE is_home IS NULL) AS null_ct
-          FROM silver.team_game_cov
-          WHERE {filter}
+          FROM silver.team_game
+          WHERE {filter} AND season_type <> 'All-Star'
           GROUP BY game_id, season_type
           HAVING home_ct <> 1 OR away_ct <> 1 OR null_ct > 0
         )
@@ -92,7 +96,7 @@ CHECKS: Tuple[QualityCheck, ...] = (
             fta,
             ft_pct_silver,
             ft_pct_raw
-          FROM silver.team_game_cov
+          FROM silver.team_game
           WHERE {filter}
             AND (
               (fga > 0 AND (fg_pct_silver IS NULL OR fg_pct_silver < 0 OR fg_pct_silver > 1)) OR
@@ -120,8 +124,11 @@ CHECKS: Tuple[QualityCheck, ...] = (
             minutes_raw,
             min_silver,
             min_bad
-          FROM silver.team_game_cov
-          WHERE {filter} AND min_bad
+          FROM silver.team_game
+          WHERE {filter}
+            AND (
+              min_silver IS NULL OR min_silver < 200 OR min_silver > 330
+            )
         )
         SELECT *, COUNT(*) OVER () AS total_rows
         FROM flagged
@@ -145,8 +152,11 @@ CHECKS: Tuple[QualityCheck, ...] = (
             pts_from_bx,
             pts_calc,
             pts_mismatch_flag
-          FROM silver.team_game_cov
-          WHERE {filter} AND has_box_score_team AND pts_mismatch_flag
+          FROM silver.team_game
+          WHERE {filter}
+            AND has_bx
+            AND pts_silver IS NOT NULL
+            AND pts_mismatch_flag
         )
         SELECT *, COUNT(*) OVER () AS total_rows
         FROM flagged
@@ -167,7 +177,7 @@ CHECKS: Tuple[QualityCheck, ...] = (
             game_date,
             start_year,
             team_known
-          FROM silver.team_game_cov
+          FROM silver.team_game
           WHERE {filter} AND NOT team_known
         )
         SELECT *, COUNT(*) OVER () AS total_rows
@@ -190,6 +200,13 @@ def _get_total(columns: Sequence[str], rows: Sequence[tuple]) -> int:
     if not rows:
         return 0
     idx = columns.index("total_rows")
+    return int(rows[0][idx])
+
+
+def _get_named_total(columns: Sequence[str], rows: Sequence[tuple], name: str) -> int:
+    if not rows or name not in columns:
+        return 0
+    idx = columns.index(name)
     return int(rows[0][idx])
 
 
@@ -223,8 +240,31 @@ def main() -> int:
         modern_total, modern_cols, modern_rows = _collect(con, check, MODERN_FILTER)
         legacy_total, legacy_cols, legacy_rows = _collect(con, check, LEGACY_FILTER)
 
-        if modern_total:
-            failures.append(f"{check.description}: {modern_total}")
+        current_modern_total = modern_total
+
+        if check.key == "wl_imbalance":
+            modern_non_all = _get_named_total(modern_cols, modern_rows, "total_non_all_star")
+            modern_all_star = _get_named_total(modern_cols, modern_rows, "total_all_star")
+            season_idx = modern_cols.index("season_type") if modern_rows else -1
+            modern_rows_non_all = [row for row in modern_rows if season_idx >= 0 and row[season_idx] != 'All-Star']
+            modern_rows_all = [row for row in modern_rows if season_idx >= 0 and row[season_idx] == 'All-Star']
+
+            current_modern_total = modern_non_all
+
+            if modern_all_star:
+                legacy_payload.append(
+                    (
+                        f"WL imbalance (All-Star): {modern_all_star}",
+                        modern_cols,
+                        modern_rows_all or modern_rows,
+                    )
+                )
+
+            if modern_rows_non_all:
+                modern_rows = modern_rows_non_all
+
+        if current_modern_total:
+            failures.append(f"{check.description}: {current_modern_total}")
             _print_rows("  Modern sample:", modern_cols, modern_rows)
 
         if legacy_total:

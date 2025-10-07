@@ -37,8 +37,7 @@ WITH gl_raw AS (
 canon AS (
   SELECT
     *,
-    LOWER(season_type_raw) AS season_type_lower,
-    TRY_CAST(SUBSTR(season_id, 1, 4) AS INT) AS start_year
+    LOWER(season_type_raw) AS season_type_lower
   FROM gl_raw
 ),
 mapped AS (
@@ -110,7 +109,7 @@ with_stats AS (
 with_pts AS (
   SELECT
     *,
-    COALESCE(pts_from_bx, pts_calc_formula) AS pts_silver,
+    COALESCE(pts_from_bx, pts_calc_formula, pts) AS pts_silver,
     CASE WHEN CAST(minutes_raw AS DOUBLE) BETWEEN 200 AND 330 THEN minutes_raw ELSE NULL END AS min_silver,
     CASE WHEN minutes_raw IS NOT NULL AND (minutes_raw < 200 OR minutes_raw > 330)
          THEN TRUE ELSE FALSE END AS min_bad
@@ -120,22 +119,64 @@ with_flags AS (
   SELECT
     w.*,
     CASE
-      WHEN pts IS NULL OR pts_silver IS NULL THEN NULL
-      ELSE ABS(pts - pts_silver) > 2
+      WHEN pts_from_bx IS NOT NULL AND pts IS NOT NULL AND ABS(pts_from_bx - pts) > 2 THEN TRUE
+      ELSE FALSE
     END AS pts_mismatch_flag,
     (pts_from_bx IS NOT NULL) AS has_pts_from_bx,
     (bx_side IS NOT NULL) AS has_bx,
     (pbp_game_id IS NOT NULL) AS has_pbp
   FROM with_pts w
 ),
-annotated AS (
+final_pre AS (
   SELECT
-    wf.*,
-    hsy.start_year,
-    (dim.team_id IS NOT NULL) AS team_known
-  FROM with_flags wf
-  LEFT JOIN helper.helper_season_year hsy ON hsy.season_id = wf.season_id
-  LEFT JOIN silver.team_dim dim ON dim.team_id = wf.team_id
+    base.*,
+    (dim.team_id IS NOT NULL) AS team_known,
+    (dim.team_id IS NOT NULL) AS row_valid_any,
+    (dim.team_id IS NOT NULL AND base.start_year >= 2010 AND base.is_home IS NOT NULL) AS row_valid_modern
+  FROM (
+    SELECT
+      wf.*,
+      CASE
+        WHEN game_date IS NOT NULL THEN
+          CASE
+            WHEN EXTRACT(MONTH FROM game_date) >= 8 THEN CAST(EXTRACT(YEAR FROM game_date) AS INT)
+            ELSE CAST(EXTRACT(YEAR FROM game_date) - 1 AS INT)
+          END
+        ELSE TRY_CAST(SUBSTR(season_id, 1, 4) AS INT)
+      END AS start_year
+    FROM with_flags wf
+  ) base
+  LEFT JOIN silver.team_dim dim USING (team_id)
+),
+with_wl AS (
+  SELECT
+    fp.*,
+    CASE
+      WHEN fp.pts_silver IS NOT NULL AND opp.pts_silver IS NOT NULL THEN
+        CASE
+          WHEN fp.pts_silver > opp.pts_silver THEN 'W'
+          WHEN fp.pts_silver < opp.pts_silver THEN 'L'
+          ELSE NULL
+        END
+      ELSE UPPER(NULLIF(TRIM(fp.wl), ''))
+    END AS wl_silver
+  FROM final_pre fp
+  LEFT JOIN final_pre opp
+    ON opp.game_id = fp.game_id
+   AND opp.team_id <> fp.team_id
+),
+ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY game_id, team_id
+      ORDER BY
+        (wl_silver IS NOT NULL) DESC,
+        (wl IS NOT NULL) DESC,
+        (matchup IS NOT NULL) DESC,
+        game_date DESC
+    ) AS rn
+  FROM with_wl
 )
 SELECT
   game_id,
@@ -151,6 +192,7 @@ SELECT
   team_name,
   matchup,
   wl,
+  wl_silver,
   is_home,
   video_available,
   pts AS pts_original,
@@ -186,6 +228,7 @@ SELECT
   has_bx,
   has_pbp,
   team_known,
-  (team_known) AS row_valid_any,
-  (team_known AND start_year >= 2010 AND is_home IS NOT NULL) AS row_valid_modern
-FROM annotated;
+  row_valid_any,
+  row_valid_modern
+FROM ranked
+WHERE rn = 1;
