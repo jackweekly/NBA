@@ -53,24 +53,28 @@ def main():
     # WL/home/away imbalance: treat as warnings if legacy
     q2 = """
       WITH games AS (SELECT DISTINCT game_id FROM bronze_game_norm),
+      r AS (
+        SELECT game_id,
+               SUM(CASE WHEN side='home' THEN 1 ELSE 0 END) AS home_ct,
+               SUM(CASE WHEN side='away' THEN 1 ELSE 0 END) AS away_ct
+        FROM silver.home_away_resolved
+        GROUP BY 1
+      ),
       flags AS (
         SELECT
           g.game_id,
           ge.game_date,
           ge.season_type,
-          CASE WHEN har.team_id_home IS NULL THEN 0 ELSE 1 END AS has_home,
-          CASE WHEN har.team_id_away IS NULL THEN 0 ELSE 1 END AS has_away
+          COALESCE(r.home_ct,0) AS home_ct,
+          COALESCE(r.away_ct,0) AS away_ct,
+          (2 - COALESCE(r.home_ct,0) - COALESCE(r.away_ct,0)) AS null_ct
         FROM games g
-        LEFT JOIN silver.home_away_resolved har USING (game_id)
-        JOIN silver.game_enriched ge USING (game_id)
+        LEFT JOIN r ON r.game_id = g.game_id
+        JOIN silver.game_enriched ge ON ge.game_id = g.game_id
       )
-      SELECT game_id, season_type, game_date,
-             SUM(has_home) AS home_ct,
-             SUM(has_away) AS away_ct,
-             (2 - SUM(has_home) - SUM(has_away)) AS null_ct  -- exactly two flags expected
+      SELECT game_id, season_type, game_date, home_ct, away_ct, null_ct
       FROM flags
-      GROUP BY 1,2,3
-      HAVING (home_ct != 1 OR away_ct != 1)
+      WHERE (home_ct != 1 OR away_ct != 1)
     """
     rows2 = con.execute(q2).fetchall()
     modern_imb = [r for r in rows2 if r[2] >= date.fromisoformat(LEGACY_CUTOFF_DATE)]

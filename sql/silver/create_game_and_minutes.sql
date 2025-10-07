@@ -7,25 +7,27 @@ WITH base AS (
   SELECT
     g.game_id,
     CAST(g.game_date AS DATE) AS game_date,
-    COALESCE(g.season_type,
-             CASE
-               WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 1 THEN 'Pre Season'
-               WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 2 THEN 'Regular Season'
-               WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 4 THEN 'Playoffs'
-               ELSE NULL
-             END) AS season_type,
+    COALESCE(
+      g.season_type,
+      CASE
+        WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 1 THEN 'Pre Season'
+        WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 2 THEN 'Regular Season'
+        WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 4 THEN 'Playoffs'
+        ELSE NULL
+      END
+    ) AS season_type,
     4 AS regulation_periods,
     CAST(NULL AS INTEGER) AS ot_periods_raw
   FROM bronze_game_norm AS g
 ),
 tm AS (
-  -- per-team minutes from silver.team_minutes
+  -- average per-team minutes actually observed (sum of player minutes)
   SELECT game_id, AVG(minutes_raw) AS avg_minutes_per_team
   FROM silver.team_minutes
   GROUP BY 1
 ),
 ot_infer AS (
-  -- infer OT periods if we lack them: each OT adds +25 team minutes
+  -- infer OT periods if raw is missing; each OT adds +25 team minutes (5 players × 5 minutes)
   SELECT
     b.game_id,
     CASE
@@ -41,10 +43,10 @@ SELECT
   b.game_date,
   b.season_type,
   b.regulation_periods,
-  COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) AS ot_periods,
-  (b.regulation_periods * 12 * 5) AS regulation_minutes_per_team,
-  (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 5 * 5) AS ot_minutes_per_team,
-  ((b.regulation_periods * 12 * 5) + (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 5 * 5)) AS target_minutes_per_team
+  COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0)                           AS ot_periods,
+  (b.regulation_periods * 12 * 5)                                                 AS regulation_minutes_per_team, -- 48*5 = 240
+  (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 25)                     AS ot_minutes_per_team,         -- each OT adds 25
+  ((b.regulation_periods * 12 * 5) + (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 25)) AS target_minutes_per_team
 FROM base b
 LEFT JOIN ot_infer o USING (game_id);
 
