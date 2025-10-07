@@ -70,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("Seeding DuckDB at %s", DUCKDB_PATH)
     _run(["python", "scripts/seed_duckdb.py"])
 
+    logging.info("Resolving home/away overrides")
+    fetch_cmd = ["python", "scripts/fetch_home_away_overrides.py"]
+    if args.verbose:
+        fetch_cmd.append("--verbose")
+    _run(fetch_cmd)
+
     logging.info("Applying warehouse schema views")
     _run(["python", "scripts/apply_schema.py"])
 
@@ -83,6 +89,12 @@ def main(argv: list[str] | None = None) -> int:
             logging.debug("Propagating --verbose flag to run_daily_update.py")
             daily_cmd.append("--verbose")
         _run(daily_cmd)
+
+        logging.info("Resolving home/away overrides after daily update")
+        fetch_cmd_post = ["python", "scripts/fetch_home_away_overrides.py"]
+        if args.verbose:
+            fetch_cmd_post.append("--verbose")
+        _run(fetch_cmd_post)
 
         logging.info("Running warehouse quality checks (post-daily)")
         _run(["python", "scripts/check_quality.py"])

@@ -13,11 +13,11 @@ from nba_db.paths import DUCKDB_PATH
 _SUBDIR_ORDER = {
     "silver": [
         "home_away_overrides.sql",
+        "box_score_team_norm.sql",
         "team_dim.sql",
         "team.sql",
         "player.sql",
         "game.sql",
-        "box_score_team_norm.sql",
         "team_game.sql",
         "team_game_coverage.sql",
     ],

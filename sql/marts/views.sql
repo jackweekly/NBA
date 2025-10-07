@@ -11,7 +11,7 @@ WITH enriched AS (
     SUM(CASE WHEN g.is_home THEN g.pts_silver END) AS home_pts,
     SUM(CASE WHEN g.is_home = FALSE THEN g.pts_silver END) AS away_pts
   FROM silver.team_game g
-  GROUP BY g.game_id, g.season_id, g.season_type, g.game_date
+  GROUP BY g.game_id, g.season_id, g.start_year, g.season_type, g.game_date
 )
 SELECT * FROM enriched;
 

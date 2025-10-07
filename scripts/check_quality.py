@@ -1,129 +1,253 @@
 #!/usr/bin/env python3
-"""Run warehouse quality checks and exit non-zero on failure."""
+"""Run warehouse quality checks and exit non-zero on modern failures."""
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
 
 import duckdb
 
-MODERN_START_YEAR = 2010
 DB_PATH = "data/nba.duckdb"
 
+MODERN_FILTER = "COALESCE(row_valid_modern, FALSE)"
+LEGACY_FILTER = "COALESCE(row_valid_any, FALSE) AND NOT COALESCE(row_valid_modern, FALSE)"
 
-def _query_scalar(con: duckdb.DuckDBPyConnection, sql: str, *params) -> int:
-    return con.execute(sql, params).fetchone()[0]
+
+@dataclass(frozen=True)
+class QualityCheck:
+    """Container for a quality check definition."""
+
+    key: str
+    description: str
+    sql_template: str  # Must include a ``{filter}`` placeholder.
+
+
+CHECKS: Tuple[QualityCheck, ...] = (
+    QualityCheck(
+        key="wl_imbalance",
+        description="WL imbalance games",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            season_type,
+            MAX(game_date) AS game_date,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(wl, '')) = 'W') AS wins,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(wl, '')) = 'L') AS losses
+          FROM silver.team_game_cov
+          WHERE {filter}
+          GROUP BY game_id, season_type
+          HAVING wins <> 1 OR losses <> 1
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id
+        LIMIT 20
+        """,
+    ),
+    QualityCheck(
+        key="home_away_imbalance",
+        description="Home/Away imbalance games",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            season_type,
+            MAX(game_date) AS game_date,
+            COUNT(*) FILTER (WHERE is_home IS TRUE) AS home_ct,
+            COUNT(*) FILTER (WHERE is_home IS FALSE) AS away_ct,
+            COUNT(*) FILTER (WHERE is_home IS NULL) AS null_ct
+          FROM silver.team_game_cov
+          WHERE {filter}
+          GROUP BY game_id, season_type
+          HAVING home_ct <> 1 OR away_ct <> 1 OR null_ct > 0
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id
+        LIMIT 20
+        """,
+    ),
+    QualityCheck(
+        key="pct_out_of_range",
+        description="Out-of-range/null pct rows",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            team_id,
+            team_name,
+            season_type,
+            game_date,
+            fgm,
+            fga,
+            fg_pct_silver,
+            fg_pct_raw,
+            fg3m,
+            fg3a,
+            fg3_pct_silver,
+            fg3_pct_raw,
+            ftm,
+            fta,
+            ft_pct_silver,
+            ft_pct_raw
+          FROM silver.team_game_cov
+          WHERE {filter}
+            AND (
+              (fga > 0 AND (fg_pct_silver IS NULL OR fg_pct_silver < 0 OR fg_pct_silver > 1)) OR
+              (fg3a > 0 AND (fg3_pct_silver IS NULL OR fg3_pct_silver < 0 OR fg3_pct_silver > 1)) OR
+              (fta > 0 AND (ft_pct_silver IS NULL OR ft_pct_silver < 0 OR ft_pct_silver > 1))
+            )
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id, team_id
+        LIMIT 20
+        """,
+    ),
+    QualityCheck(
+        key="minutes_implausible",
+        description="Implausible team minutes rows",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            team_id,
+            team_name,
+            season_type,
+            game_date,
+            minutes_raw,
+            min_silver,
+            min_bad
+          FROM silver.team_game_cov
+          WHERE {filter} AND min_bad
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id, team_id
+        LIMIT 20
+        """,
+    ),
+    QualityCheck(
+        key="points_mismatch",
+        description="Points identity mismatches (has box score)",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            team_id,
+            team_name,
+            season_type,
+            game_date,
+            pts_original,
+            pts_silver,
+            pts_from_bx,
+            pts_calc,
+            pts_mismatch_flag
+          FROM silver.team_game_cov
+          WHERE {filter} AND has_box_score_team AND pts_mismatch_flag
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id, team_id
+        LIMIT 20
+        """,
+    ),
+    QualityCheck(
+        key="team_unknown",
+        description="Unknown team_id in seasons",
+        sql_template="""
+        WITH flagged AS (
+          SELECT
+            game_id,
+            team_id,
+            team_name,
+            season_type,
+            game_date,
+            start_year,
+            team_known
+          FROM silver.team_game_cov
+          WHERE {filter} AND NOT team_known
+        )
+        SELECT *, COUNT(*) OVER () AS total_rows
+        FROM flagged
+        ORDER BY game_date DESC NULLS LAST, game_id, team_id
+        LIMIT 20
+        """,
+    ),
+)
+
+
+def _run_query(con: duckdb.DuckDBPyConnection, sql: str) -> tuple[list[str], list[tuple]]:
+    rel = con.execute(sql)
+    columns = [desc[0] for desc in rel.description]
+    rows = rel.fetchall()
+    return columns, rows
+
+
+def _get_total(columns: Sequence[str], rows: Sequence[tuple]) -> int:
+    if not rows:
+        return 0
+    idx = columns.index("total_rows")
+    return int(rows[0][idx])
+
+
+def _print_rows(label: str, columns: Sequence[str], rows: Sequence[tuple]) -> None:
+    if not rows:
+        return
+    print(label)
+    display_cols = [col for col in columns if col != "total_rows"]
+    for row in rows:
+        data = {col: value for col, value in zip(columns, row)}
+        parts = [f"{col}={data[col]!r}" for col in display_cols]
+        print(f"    {', '.join(parts)}")
+
+
+def _collect(
+    con: duckdb.DuckDBPyConnection,
+    check: QualityCheck,
+    filter_sql: str,
+) -> tuple[int, list[str], list[tuple]]:
+    columns, rows = _run_query(con, check.sql_template.format(filter=filter_sql))
+    return _get_total(columns, rows), columns, rows
 
 
 def main() -> int:
     con = duckdb.connect(DB_PATH, read_only=True)
 
-    con.execute(
-        f"""
-        CREATE OR REPLACE TEMP VIEW v_modern AS
-        SELECT sgc.*, h.start_year
-        FROM silver.team_game_cov AS sgc
-        JOIN helper.helper_season_year AS h USING (season_id)
-        WHERE h.start_year IS NOT NULL AND h.start_year >= {MODERN_START_YEAR}
-        """
-    )
+    failures: List[str] = []
+    legacy_payload: List[tuple[str, list[str], list[tuple]]] = []
 
-    failures: list[str] = []
+    for check in CHECKS:
+        modern_total, modern_cols, modern_rows = _collect(con, check, MODERN_FILTER)
+        legacy_total, legacy_cols, legacy_rows = _collect(con, check, LEGACY_FILTER)
 
-    bad_wl = _query_scalar(
-        con,
-        """
-        WITH k AS (
-            SELECT game_id, season_type,
-                   SUM(CASE WHEN wl = 'W' THEN 1 ELSE 0 END) AS w,
-                   SUM(CASE WHEN wl = 'L' THEN 1 ELSE 0 END) AS l
-            FROM v_modern
-            GROUP BY 1, 2
-        )
-        SELECT COUNT(*) FROM k WHERE NOT (w = 1 AND l = 1)
-        """,
-    )
-    if bad_wl:
-        failures.append(f"WL imbalance games: {bad_wl}")
+        if modern_total:
+            failures.append(f"{check.description}: {modern_total}")
+            _print_rows("  Modern sample:", modern_cols, modern_rows)
 
-    bad_homeaway = _query_scalar(
-        con,
-        """
-        WITH f AS (
-            SELECT game_id, season_type,
-                   SUM(CASE WHEN is_home THEN 1 ELSE 0 END) AS home_ct,
-                   SUM(CASE WHEN is_home = FALSE THEN 1 ELSE 0 END) AS away_ct
-            FROM v_modern
-            GROUP BY 1, 2
-        )
-        SELECT COUNT(*) FROM f WHERE home_ct <> 1 OR away_ct <> 1
-        """,
-    )
-    if bad_homeaway:
-        failures.append(f"Home/Away imbalance games: {bad_homeaway}")
-
-    bad_pct = con.execute(
-        """
-        SELECT
-          SUM(CASE WHEN fga > 0 AND (fg_pct IS NULL OR fg_pct < 0 OR fg_pct > 1) THEN 1 ELSE 0 END) AS fg_bad,
-          SUM(CASE WHEN fg3a > 0 AND (fg3_pct IS NULL OR fg3_pct < 0 OR fg3_pct > 1) THEN 1 ELSE 0 END) AS fg3_bad,
-          SUM(CASE WHEN fta > 0 AND (ft_pct IS NULL OR ft_pct < 0 OR ft_pct > 1) THEN 1 ELSE 0 END) AS ft_bad
-        FROM v_modern
-        """,
-    ).fetchone()
-    if any(value and value > 0 for value in bad_pct):
-        failures.append(
-            "Out-of-range/null pct in modern seasons: "
-            f"fg={bad_pct[0]}, fg3={bad_pct[1]}, ft={bad_pct[2]}"
-        )
-
-    bad_min = _query_scalar(
-        con,
-        """
-        SELECT COUNT(*)
-        FROM v_modern
-        WHERE min < 200 OR min > 330
-        """,
-    )
-    if bad_min:
-        failures.append(f"Implausible team minutes rows: {bad_min}")
-
-    bad_pts = _query_scalar(
-        con,
-        """
-        SELECT COUNT(*)
-        FROM v_modern
-        WHERE has_box_score_team
-          AND pts IS NOT NULL
-          AND ABS(pts - calc_pts) > 2
-        """,
-    )
-    if bad_pts:
-        failures.append(f"Points identity mismatches (modern + has box score): {bad_pts}")
-
-    bad_team_dim = _query_scalar(
-        con,
-        """
-        WITH t AS (
-          SELECT DISTINCT team_id FROM silver.team_dim
-        )
-        SELECT COUNT(*)
-        FROM (
-          SELECT DISTINCT team_id FROM v_modern
-        ) m
-        LEFT JOIN t USING (team_id)
-        WHERE t.team_id IS NULL
-        """,
-    )
-    if bad_team_dim:
-        failures.append(f"Unknown team_id in modern seasons: {bad_team_dim}")
+        if legacy_total:
+            legacy_payload.append((f"{check.description}: {legacy_total}", legacy_cols, legacy_rows))
 
     if failures:
         print("QUALITY CHECK FAILURES:")
         for failure in failures:
-            print(" -", failure)
+            print(f" - {failure}")
+        if legacy_payload:
+            print("\nQUALITY WARNINGS (pre-2010 or partial rows):")
+            for message, columns, rows in legacy_payload:
+                print(f" - {message}")
+                _print_rows("    Legacy sample:", columns, rows)
         return 1
 
-    print("Quality checks passed.")
+    if legacy_payload:
+        print("QUALITY WARNINGS (pre-2010 or partial rows):")
+        for message, columns, rows in legacy_payload:
+            print(f" - {message}")
+            _print_rows("    Legacy sample:", columns, rows)
+
+    print("Quality checks passed for modern seasons.")
     return 0
 
 
