@@ -5,11 +5,12 @@ import logging
 import random
 import time
 from datetime import date
-from typing import Optional, Iterable
+from typing import Optional
 
 import pandas as pd
 import requests
 from requests import HTTPError, exceptions as requests_exceptions
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .utils import get_proxies
 
@@ -258,9 +259,23 @@ __all__ = ["get_league_game_log_from_date", "SEASON_TYPES"]
 
 BOX_SCORE_URL = "https://stats.nba.com/stats/boxscoretraditionalv2"
 PLAY_BY_PLAY_URL = "https://stats.nba.com/stats/playbyplayv2"
-PER_GAME_SLEEP_SECONDS = 0.35
+DETAIL_SUCCESS_SLEEP_SECONDS = 0.25
+PER_GAME_SLEEP_SECONDS = DETAIL_SUCCESS_SLEEP_SECONDS  # backwards compatibility for tests
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
+def _retryable_http(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError) and getattr(exc.response, "status_code", None) is not None:
+        return exc.response.status_code in RETRYABLE_STATUS_CODES
+    return isinstance(exc, requests_exceptions.RequestException)
+
+
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception(_retryable_http),
+    reraise=True,
+)
 def _fetch_json(endpoint: str, params: dict[str, object], *, timeout: int, proxy: str | None) -> dict:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     response = requests.get(
@@ -298,7 +313,7 @@ def get_box_score(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> tuple[pd.D
 
     def _fetch():
         proxy = random.choice(proxies) if proxies else None
-        payload = _fetch_json(
+        return _fetch_json(
             BOX_SCORE_URL,
             {
                 "GameID": game_id,
@@ -311,15 +326,24 @@ def get_box_score(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> tuple[pd.D
             timeout=timeout,
             proxy=proxy,
         )
-        return payload
 
-    payload = _call_with_retry(f"boxscoretraditionalv2 {game_id}", _fetch)
+    try:
+        payload = _fetch()
+    except HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 400:
+            LOGGER.warning("Skip %s: 400 (bad game_id)", game_id)
+            return pd.DataFrame(), pd.DataFrame()
+        raise
+    except requests_exceptions.RequestException as exc:
+        raise RuntimeError(f"Failed to fetch box score for {game_id}") from exc
     player = _frame_from_result(payload, "PlayerStats")
     team = _frame_from_result(payload, "TeamStats")
     if not player.empty:
         player["game_id"] = str(game_id)
     if not team.empty:
         team["game_id"] = str(game_id)
+    time.sleep(DETAIL_SUCCESS_SLEEP_SECONDS)
     return team, player
 
 
@@ -330,7 +354,7 @@ def get_play_by_play(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> pd.Data
 
     def _fetch():
         proxy = random.choice(proxies) if proxies else None
-        payload = _fetch_json(
+        return _fetch_json(
             PLAY_BY_PLAY_URL,
             {
                 "GameID": game_id,
@@ -340,10 +364,19 @@ def get_play_by_play(game_id: str, *, timeout: int = DEFAULT_TIMEOUT) -> pd.Data
             timeout=timeout,
             proxy=proxy,
         )
-        return payload
 
-    payload = _call_with_retry(f"playbyplayv2 {game_id}", _fetch)
+    try:
+        payload = _fetch()
+    except HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 400:
+            LOGGER.warning("Skip %s PBP: 400 (bad game_id)", game_id)
+            return pd.DataFrame()
+        raise
+    except requests_exceptions.RequestException as exc:
+        raise RuntimeError(f"Failed to fetch play-by-play for {game_id}") from exc
     frame = _frame_from_result(payload, "PlayByPlay")
     if not frame.empty:
         frame["game_id"] = str(game_id)
+    time.sleep(DETAIL_SUCCESS_SLEEP_SECONDS)
     return frame

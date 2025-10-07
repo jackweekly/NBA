@@ -9,7 +9,10 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from nba_db.paths import ROOT, WATERMARK_PATH
+import duckdb
+import pandas as pd
+
+from nba_db.paths import ROOT, WATERMARK_PATH, DUCKDB_PATH
 
 
 _NUMERIC_ENV_DEFAULTS = {
@@ -57,6 +60,28 @@ def _read_watermark() -> Optional[date]:
         return None
 
 
+def _latest_warehouse_watermark() -> Optional[date]:
+    if not DUCKDB_PATH.exists():
+        return None
+    try:
+        con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+    except duckdb.Error as exc:
+        logging.debug("Unable to open warehouse for watermark lookup: %s", exc)
+        return None
+    try:
+        (primary,) = con.execute("SELECT MAX(game_date) FROM bronze_game_log_team").fetchone()
+        if primary is not None:
+            return pd.to_datetime(primary).date()
+        (fallback,) = con.execute("SELECT MAX(game_date) FROM bronze_game").fetchone()
+        if fallback is not None:
+            return pd.to_datetime(fallback).date()
+    except duckdb.Error as exc:
+        logging.warning("Failed to read warehouse watermark: %s", exc)
+    finally:
+        con.close()
+    return None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
 
@@ -83,14 +108,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         logging.info("Fetching full historical game log; ignoring bootstrap watermark and existing data")
     else:
         if resolved_start is None:
-            watermark_date = _read_watermark()
+            watermark_date = _latest_warehouse_watermark()
+            source = "warehouse"
+            if watermark_date is None:
+                watermark_date = _read_watermark()
+                source = "bootstrap"
             if watermark_date is not None:
                 resolved_start = (watermark_date + timedelta(days=1)).isoformat()
                 logging.info(
-                    "Using bootstrap watermark %s -> start date %s",
+                    "Using %s watermark %s -> start date %s",
+                    source,
                     watermark_date.isoformat(),
                     resolved_start,
                 )
+            else:
+                logging.info("No watermark found; defaulting to NBA API minimum window")
 
     try:
         result = update.daily(

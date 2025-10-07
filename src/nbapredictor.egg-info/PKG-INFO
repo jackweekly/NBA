@@ -11,6 +11,7 @@ Requires-Dist: nba_api>=1.5.7
 Requires-Dist: python-dateutil>=2.9
 Requires-Dist: pyyaml>=6.0
 Requires-Dist: duckdb>=1.0
+Requires-Dist: tenacity>=8.2
 
 # NBA Predictor Data Pipeline
 

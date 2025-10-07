@@ -4,3 +4,4 @@ nba_api>=1.5.7
 python-dateutil>=2.9
 pyyaml>=6.0
 duckdb>=1.0
+tenacity>=8.2

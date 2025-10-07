@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -14,6 +13,7 @@ import duckdb
 import pandas as pd
 
 from . import extract
+from .utils import canonicalize_game_ids
 from .paths import DUCKDB_PATH, GAME_CSV, RAW_DIR
 
 
@@ -24,7 +24,7 @@ DEFAULT_SEASON_TYPE = "Regular Season"
 HISTORICAL_START_DATE = date(1946, 11, 1)
 
 
-MAX_DETAIL_WORKERS = int(os.environ.get("NBA_DB_DETAIL_WORKERS", "6"))
+MAX_DETAIL_WORKERS = min(int(os.environ.get("NBA_DB_DETAIL_WORKERS", "6")), 8)
 
 
 @dataclass(slots=True)
@@ -68,13 +68,14 @@ def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
         canonical["season_type"] = (
             canonical["season_type"].fillna(DEFAULT_SEASON_TYPE).replace("", DEFAULT_SEASON_TYPE)
         )
-    for column in ("season_id", "game_id", "team_id"):
+    for column in ("season_id", "team_id"):
         if column not in canonical.columns:
             continue
-        series = canonical[column].astype(str).str.strip()
-        if column in {"game_id", "team_id"}:
-            series = series.str.lstrip("0").replace({"": "0"})
-        canonical[column] = series
+        canonical[column] = canonical[column].astype(str).str.strip()
+        if column == "team_id":
+            canonical[column] = canonical[column].replace({"": "0"})
+    if "game_id" in canonical.columns:
+        canonical = canonicalize_game_ids(canonical, column="game_id")
     return canonical
 
 
@@ -281,8 +282,6 @@ def _fetch_boxscores(game_ids: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFram
         except RuntimeError as exc:  # noqa: BLE001 - network errors already logged
             LOGGER.warning("Box score fetch failed for %s: %s", game_id, exc)
             return pd.DataFrame(), pd.DataFrame()
-        finally:
-            time.sleep(extract.PER_GAME_SLEEP_SECONDS)
         if not team_frame.empty:
             team_frame = _normalise_id_columns(team_frame, ["game_id", "team_id"])
         if not player_frame.empty:
@@ -318,8 +317,6 @@ def _fetch_play_by_play_games(game_ids: Sequence[str]) -> pd.DataFrame:
         except RuntimeError as exc:  # noqa: BLE001
             LOGGER.warning("Play-by-play fetch failed for %s: %s", game_id, exc)
             return pd.DataFrame()
-        finally:
-            time.sleep(extract.PER_GAME_SLEEP_SECONDS)
         if frame.empty:
             return frame
         frame = _normalise_id_columns(frame, ["game_id", "team_id"])
@@ -422,7 +419,10 @@ def daily(
             return DailyUpdateResult(target_path, 0, appended=False, final_row_count=0)
 
         new_rows = _deduplicate(new_rows)
-        game_ids = sorted(new_rows.get("game_id", pd.Series(dtype=str)).dropna().unique().tolist())
+        game_ids_frame = canonicalize_game_ids(new_rows[["game_id"]], column="game_id")
+        game_ids = (
+            game_ids_frame.drop_duplicates()["game_id"].dropna().sort_values().tolist()
+        )
         _log_fetch_window(new_rows)
         _atomic_write_csv(new_rows, target_path)
         _upsert_duckdb(new_rows, replace=True)
@@ -464,7 +464,10 @@ def daily(
         LOGGER.info("NBA API returned no games for %s onward", fetch_from.isoformat())
         return DailyUpdateResult(target_path, 0, appended=True, final_row_count=len(existing))
 
-    game_ids = sorted(new_rows.get("game_id", pd.Series(dtype=str)).dropna().unique().tolist())
+    game_ids_frame = canonicalize_game_ids(new_rows[["game_id"]], column="game_id")
+    game_ids = (
+        game_ids_frame.drop_duplicates()["game_id"].dropna().sort_values().tolist()
+    )
 
     _log_fetch_window(new_rows)
 

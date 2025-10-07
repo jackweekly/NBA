@@ -7,7 +7,7 @@ CREATE SCHEMA IF NOT EXISTS marts;
 CREATE OR REPLACE VIEW silver.team_game AS
 SELECT
   CAST(season_id AS VARCHAR)                  AS season_id,
-  CAST(game_id AS VARCHAR)                    AS game_id,
+  LPAD(CAST(game_id AS VARCHAR), 10, '0')     AS game_id,
   CAST(team_id AS VARCHAR)                    AS team_id,
   LOWER(team_abbreviation)                    AS team_abbreviation,
   team_name,

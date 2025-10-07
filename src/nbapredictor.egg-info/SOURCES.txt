@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/nba_db/__init__.py
+src/nba_db/duckdb_seed.py
 src/nba_db/extract.py
 src/nba_db/logger.py
 src/nba_db/paths.py
@@ -13,6 +14,9 @@ src/nbapredictor.egg-info/SOURCES.txt
 src/nbapredictor.egg-info/dependency_links.txt
 src/nbapredictor.egg-info/requires.txt
 src/nbapredictor.egg-info/top_level.txt
+tests/test_duckdb_pipeline.py
+tests/test_extract_real_api.py
 tests/test_nbadb_sync.py
 tests/test_scripts.py
 tests/test_update.py
+tests/test_update_daily.py
