@@ -32,31 +32,36 @@ BACKOFF_SECONDS = 1.5
 MAX_WORKERS = 4
 
 
-def _ensure_schemas(con: duckdb.DuckDBPyConnection) -> None:
-    """Ensure required schemas exist before interacting with tables."""
+def _has_cols(con, table, cols):
+    q = """
+      SELECT LOWER(column_name)
+      FROM information_schema.columns
+      WHERE LOWER(table_name)=?"""
+    present = {r[0] for r in con.execute(q, [table.lower()]).fetchall()}
+    return all(c.lower() in present for c in cols)
 
+
+def _ensure_schemas(con):
+    """Ensure required schemas exist before interacting with tables."""
     con.execute("CREATE SCHEMA IF NOT EXISTS silver")
 
 
-def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
+def _ensure_table(con):
     """Create the overrides table when missing."""
-
     _ensure_schemas(con)
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
-            game_id        BIGINT PRIMARY KEY,
-            date           DATE,
-            season         INTEGER,
-            team_id_home   INTEGER,
-            team_id_away   INTEGER,
-            home_override  BOOLEAN,
-            away_override  BOOLEAN,
-            source         VARCHAR,
-            updated_at     TIMESTAMP DEFAULT now()
-        )
-        """
-    )
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS silver.home_away_overrides (
+        game_id        BIGINT PRIMARY KEY,
+        date           DATE,
+        season         INTEGER,
+        team_id_home   INTEGER,
+        team_id_away   INTEGER,
+        home_override  BOOLEAN,
+        away_override  BOOLEAN,
+        source         VARCHAR,
+        updated_at     TIMESTAMP DEFAULT now()
+      )
+    """)
 
 
 @dataclass
@@ -70,40 +75,55 @@ class GameOverride:
     team_id_away: int
 
 
-def _discover_from_bronze(con: duckdb.DuckDBPyConnection) -> list[str]:
-    """Fallback discovery using raw bronze tables when views are unavailable."""
-
-    query = """
-        WITH base AS (
-          SELECT
-            LPAD(CAST(game_id AS VARCHAR), 10, '0') AS game_id,
-            COUNT(DISTINCT team_id) AS team_ct,
-            COUNT(*) FILTER (WHERE POSITION('vs.' IN LOWER(COALESCE(matchup, ''))) > 0) AS vs_ct,
-            COUNT(*) FILTER (WHERE POSITION('@' IN COALESCE(matchup, '')) > 0) AS at_ct
-          FROM bronze_game_log_team
-          GROUP BY 1
-        )
-        SELECT b.game_id
-        FROM base b
-        LEFT JOIN (
-          SELECT DISTINCT LPAD(CAST(game_id AS VARCHAR), 10, '0') AS game_id
-          FROM silver.home_away_overrides
-        ) o ON o.game_id = b.game_id
-        WHERE o.game_id IS NULL
-          AND b.team_ct = 2
-          AND b.vs_ct = 0
-          AND b.at_ct >= 2
-        ORDER BY b.game_id
+def _discover_from_bronze(con):
     """
-    rows = con.execute(query).fetchall()
-    return [row[0] for row in rows]
+    Return candidate games for override resolution.
+    Tries (in order):
+      A) bronze_game with explicit home/visitor columns
+      B) derive from bronze_box_score_team via is_home flag
+      C) fallback: just distinct game_ids from bronze_game
+    """
+    # A) If bronze_game has home/visitor IDs, use them directly
+    if _has_cols(con, "bronze_game", {"home_team_id", "visitor_team_id"}):
+        return con.execute("""
+            SELECT DISTINCT
+                game_id,
+                home_team_id   AS team_id_home,
+                visitor_team_id AS team_id_away
+            FROM bronze_game
+            WHERE game_id IS NOT NULL
+        """).fetchall()
+
+    # B) If team-level box has is_home, infer home/away
+    if _has_cols(con, "bronze_box_score_team", {"game_id", "team_id", "is_home"}):
+        return con.execute("""
+            WITH by_game AS (
+              SELECT
+                game_id,
+                MAX(CASE WHEN is_home THEN team_id END) AS team_id_home,
+                MAX(CASE WHEN NOT is_home THEN team_id END) AS team_id_away
+              FROM bronze_box_score_team
+              GROUP BY 1
+            )
+            SELECT game_id, team_id_home, team_id_away
+            FROM by_game
+            WHERE game_id IS NOT NULL
+        """).fetchall()
+
+    # C) Fallback: just emit the IDs (downstream will fetch details)
+    return con.execute("""
+        SELECT DISTINCT game_id
+        FROM bronze_game
+        WHERE game_id IS NOT NULL
+    """).fetchall()
 
 
 def _discover_games(con: duckdb.DuckDBPyConnection, explicit: Sequence[str]) -> list[str]:
     if explicit:
         return sorted({game_id.strip() for game_id in explicit if game_id.strip()})
 
-    return _discover_from_bronze(con)
+    rows = _discover_from_bronze(con)
+    return [str(row[0]) for row in rows]
 
 
 def _fetch_single(game_id: str) -> GameOverride:
