@@ -51,6 +51,7 @@ def _create_bronze_game_norm(con):
 _SUBDIR_ORDER = {
     "silver": [
         "home_away_overrides.sql",
+        "create_game_and_minutes.sql",
         "box_score_team_norm.sql",
         "team_dim.sql",
         "team.sql",
@@ -84,11 +85,6 @@ def _collect_sql_files(root: pathlib.Path) -> list[pathlib.Path]:
     return ordered
 
 
-def _statements_from(path: pathlib.Path) -> list[str]:
-    text = path.read_text()
-    return [stmt.strip() for stmt in text.split(';') if stmt.strip()]
-
-
 def main() -> int:
     con = duckdb.connect(str(DUCKDB_PATH))
     con.execute('PRAGMA threads=4;')
@@ -105,13 +101,11 @@ def main() -> int:
             return 1
 
         for sql_file in sql_files:
-            for statement in _statements_from(sql_file):
-                try:
-                    con.execute(statement)
-                except Exception as e:
-                    print("==== Failed statement ====")
-                    print(statement)
-                    raise
+            try:
+                con.execute(sql_file.read_text())
+            except Exception as e:
+                print(f"==== Failed in file: {sql_file} ====")
+                raise
     finally:
         con.close()
 

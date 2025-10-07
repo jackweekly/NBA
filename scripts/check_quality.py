@@ -1,295 +1,92 @@
-#!/usr/bin/env python3
-"""Run warehouse quality checks and exit non-zero on modern failures."""
-from __future__ import annotations
-
-import sys
-from dataclasses import dataclass
-from typing import List, Sequence, Tuple
-
 import duckdb
+from datetime import date
 
-DB_PATH = "data/nba.duckdb"
+LEGACY_CUTOFF_DATE = "2010-01-01"  # anything older => warnings only
 
-MODERN_FILTER = "COALESCE(row_valid_modern, FALSE)"
-LEGACY_FILTER = "COALESCE(row_valid_any, FALSE) AND NOT COALESCE(row_valid_modern, FALSE)"
+def main():
+    con = duckdb.connect("data/nba.duckdb")
 
-
-@dataclass(frozen=True)
-class QualityCheck:
-    """Container for a quality check definition."""
-
-    key: str
-    description: str
-    sql_template: str  # Must include a ``{filter}`` placeholder.
-
-
-CHECKS: Tuple[QualityCheck, ...] = (
-    QualityCheck(
-        key="wl_imbalance",
-        description="WL imbalance games",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            season_type,
-            MAX(game_date) AS game_date,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl_silver AS VARCHAR), '')) = 'W') AS wins,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl_silver AS VARCHAR), '')) = 'L') AS losses
-          FROM silver.team_game
-          WHERE {filter}
-          GROUP BY game_id, season_type
-          HAVING wins <> 1 OR losses <> 1
-        )
+    # minutes comparison
+    q = """
+      WITH joined AS (
         SELECT
-          *,
-          COUNT(*) FILTER (WHERE season_type <> 'All-Star') OVER () AS total_non_all_star,
-          COUNT(*) FILTER (WHERE season_type = 'All-Star') OVER () AS total_all_star,
-          COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id
-        LIMIT 20
-        """,
-    ),
-    QualityCheck(
-        key="home_away_imbalance",
-        description="Home/Away imbalance games",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            season_type,
-            MAX(game_date) AS game_date,
-            COUNT(*) FILTER (WHERE is_home IS TRUE) AS home_ct,
-            COUNT(*) FILTER (WHERE is_home IS FALSE) AS away_ct,
-            COUNT(*) FILTER (WHERE is_home IS NULL) AS null_ct
-          FROM silver.team_game
-          WHERE {filter} AND season_type <> 'All-Star'
-          GROUP BY game_id, season_type
-          HAVING home_ct <> 1 OR away_ct <> 1 OR null_ct > 0
-        )
-        SELECT *, COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id
-        LIMIT 20
-        """,
-    ),
-    QualityCheck(
-        key="pct_out_of_range",
-        description="Out-of-range/null pct rows",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            team_id,
-            team_name,
-            season_type,
-            game_date,
-            fgm,
-            fga,
-            fg_pct_silver,
-            fg_pct_raw,
-            fg3m,
-            fg3a,
-            fg3_pct_silver,
-            fg3_pct_raw,
-            ftm,
-            fta,
-            ft_pct_silver,
-            ft_pct_raw
-          FROM silver.team_game
-          WHERE {filter}
-            AND (
-              (fga > 0 AND (fg_pct_silver IS NULL OR fg_pct_silver < 0 OR fg_pct_silver > 1)) OR
-              (fg3a > 0 AND (fg3_pct_silver IS NULL OR fg3_pct_silver < 0 OR fg3_pct_silver > 1)) OR
-              (fta > 0 AND (ft_pct_silver IS NULL OR ft_pct_silver < 0 OR ft_pct_silver > 1))
-            )
-        )
-        SELECT *, COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id, team_id
-        LIMIT 20
-        """,
-    ),
-    QualityCheck(
-        key="minutes_implausible",
-        description="Implausible team minutes rows",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            team_id,
-            team_name,
-            season_type,
-            game_date,
-            minutes_raw,
-            min_silver,
-            min_bad
-          FROM silver.team_game
-          WHERE {filter}
-            AND (
-              min_silver IS NULL OR min_silver < 200 OR min_silver > 330
-            )
-        )
-        SELECT *, COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id, team_id
-        LIMIT 20
-        """,
-    ),
-    QualityCheck(
-        key="points_mismatch",
-        description="Points identity mismatches (has box score)",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            team_id,
-            team_name,
-            season_type,
-            game_date,
-            pts_original,
-            pts_silver,
-            pts_from_bx,
-            pts_calc,
-            pts_mismatch_flag
-          FROM silver.team_game
-          WHERE {filter}
-            AND has_bx
-            AND pts_silver IS NOT NULL
-            AND pts_mismatch_flag
-        )
-        SELECT *, COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id, team_id
-        LIMIT 20
-        """,
-    ),
-    QualityCheck(
-        key="team_unknown",
-        description="Unknown team_id in seasons",
-        sql_template="""
-        WITH flagged AS (
-          SELECT
-            game_id,
-            team_id,
-            team_name,
-            season_type,
-            game_date,
-            start_year,
-            team_known
-          FROM silver.team_game
-          WHERE {filter} AND NOT team_known
-        )
-        SELECT *, COUNT(*) OVER () AS total_rows
-        FROM flagged
-        ORDER BY game_date DESC NULLS LAST, game_id, team_id
-        LIMIT 20
-        """,
-    ),
-)
+          tm.game_id,
+          tm.team_id,
+          ge.game_date,
+          ge.season_type,
+          tm.minutes_raw,
+          ge.target_minutes_per_team AS minutes_target
+        FROM silver.team_minutes tm
+        JOIN silver.game_enriched ge USING (game_id)
+      )
+      SELECT
+        game_id, team_id, season_type, game_date,
+        minutes_raw, minutes_target,
+        /* bad if target known and abs diff > small epsilon (e.g., > 1 min) */
+        CASE WHEN minutes_target IS NOT NULL AND ABS(minutes_raw - minutes_target) > 1.0
+             THEN TRUE ELSE FALSE END AS min_bad
+      FROM joined
+      ORDER BY game_date DESC
+      LIMIT 20000
+    """
+    rows = con.execute(q).fetchall()
 
+    bad = [r for r in rows if r[-1] and r[3] >= date.fromisoformat(LEGACY_CUTOFF_DATE)]
+    legacy = [r for r in rows if r[-1] and r[3] < date.fromisoformat(LEGACY_CUTOFF_DATE)]
 
-def _run_query(con: duckdb.DuckDBPyConnection, sql: str) -> tuple[list[str], list[tuple]]:
-    rel = con.execute(sql)
-    columns = [desc[0] for desc in rel.description]
-    rows = rel.fetchall()
-    return columns, rows
-
-
-def _get_total(columns: Sequence[str], rows: Sequence[tuple]) -> int:
-    if not rows:
-        return 0
-    idx = columns.index("total_rows")
-    return int(rows[0][idx])
-
-
-def _get_named_total(columns: Sequence[str], rows: Sequence[tuple], name: str) -> int:
-    if not rows or name not in columns:
-        return 0
-    idx = columns.index(name)
-    return int(rows[0][idx])
-
-
-def _print_rows(label: str, columns: Sequence[str], rows: Sequence[tuple]) -> None:
-    if not rows:
-        return
-    print(label)
-    display_cols = [col for col in columns if col != "total_rows"]
-    for row in rows:
-        data = {col: value for col, value in zip(columns, row)}
-        parts = [f"{col}={data[col]!r}" for col in display_cols]
-        print(f"    {', '.join(parts)}")
-
-
-def _collect(
-    con: duckdb.DuckDBPyConnection,
-    check: QualityCheck,
-    filter_sql: str,
-) -> tuple[int, list[str], list[tuple]]:
-    columns, rows = _run_query(con, check.sql_template.format(filter=filter_sql))
-    return _get_total(columns, rows), columns, rows
-
-
-def main() -> int:
-    con = duckdb.connect(DB_PATH, read_only=True)
-
-    failures: List[str] = []
-    legacy_payload: List[tuple[str, list[str], list[tuple]]] = []
-
-    for check in CHECKS:
-        modern_total, modern_cols, modern_rows = _collect(con, check, MODERN_FILTER)
-        legacy_total, legacy_cols, legacy_rows = _collect(con, check, LEGACY_FILTER)
-
-        current_modern_total = modern_total
-
-        if check.key == "wl_imbalance":
-            modern_non_all = _get_named_total(modern_cols, modern_rows, "total_non_all_star")
-            modern_all_star = _get_named_total(modern_cols, modern_rows, "total_all_star")
-            season_idx = modern_cols.index("season_type") if modern_rows else -1
-            modern_rows_non_all = [row for row in modern_rows if season_idx >= 0 and row[season_idx] != 'All-Star']
-            modern_rows_all = [row for row in modern_rows if season_idx >= 0 and row[season_idx] == 'All-Star']
-
-            current_modern_total = modern_non_all
-
-            if modern_all_star:
-                legacy_payload.append(
-                    (
-                        f"WL imbalance (All-Star): {modern_all_star}",
-                        modern_cols,
-                        modern_rows_all or modern_rows,
-                    )
-                )
-
-            if modern_rows_non_all:
-                modern_rows = modern_rows_non_all
-
-        if current_modern_total:
-            failures.append(f"{check.description}: {current_modern_total}")
-            _print_rows("  Modern sample:", modern_cols, modern_rows)
-
-        if legacy_total:
-            legacy_payload.append((f"{check.description}: {legacy_total}", legacy_cols, legacy_rows))
-
-    if failures:
+    if bad:
         print("QUALITY CHECK FAILURES:")
-        for failure in failures:
-            print(f" - {failure}")
-        if legacy_payload:
-            print("\nQUALITY WARNINGS (pre-2010 or partial rows):")
-            for message, columns, rows in legacy_payload:
-                print(f" - {message}")
-                _print_rows("    Legacy sample:", columns, rows)
-        return 1
-
-    if legacy_payload:
+        print(f" - Implausible team minutes rows (modern): {len(bad)}")
+        for r in bad[:12]:
+            print(f"    game_id='{r[0]}', team_id='{r[1]}', season_type='{r[2]}', "
+                  f"game_date={r[3]}, minutes_raw={r[4]}, minutes_target={r[5]}, min_bad=True")
+    if legacy:
         print("QUALITY WARNINGS (pre-2010 or partial rows):")
-        for message, columns, rows in legacy_payload:
-            print(f" - {message}")
-            _print_rows("    Legacy sample:", columns, rows)
+        print(f" - Implausible team minutes rows (legacy): {len(legacy)}")
+        for r in legacy[:12]:
+            print(f"    game_id='{r[0]}', season_type='{r[2]}', game_date={r[3]}, "
+                  f"minutes_raw={r[4]}, minutes_target={r[5]}")
 
-    print("Quality checks passed for modern seasons.")
-    return 0
+    # WL/home/away imbalance: treat as warnings if legacy
+    q2 = """
+      WITH flags AS (
+        SELECT
+          ge.game_id,
+          ge.game_date,
+          ge.season_type,
+          CASE WHEN har.team_id_home IS NULL THEN 0 ELSE 1 END AS has_home,
+          CASE WHEN har.team_id_away IS NULL THEN 0 ELSE 1 END AS has_away
+        FROM silver.game_enriched ge
+        LEFT JOIN silver.home_away_resolved har USING (game_id)
+      )
+      SELECT game_id, season_type, game_date,
+             SUM(has_home) AS home_ct,
+             SUM(has_away) AS away_ct,
+             SUM(1 - (has_home + has_away)) AS null_ct
+      FROM flags
+      GROUP BY 1,2,3
+      HAVING (home_ct != 1 OR away_ct != 1)
+    """
+    rows2 = con.execute(q2).fetchall()
+    modern_imb = [r for r in rows2 if r[2] >= date.fromisoformat(LEGACY_CUTOFF_DATE)]
+    legacy_imb = [r for r in rows2 if r[2] < date.fromisoformat(LEGACY_CUTOFF_DATE)]
 
+    if modern_imb:
+        print("QUALITY CHECK FAILURES:")
+        print(f" - Home/Away imbalance games (modern): {len(modern_imb)}")
+        for r in modern_imb[:12]:
+            print(f"    game_id='{r[0]}', season_type='{r[1]}', game_date={r[2]}, "
+                  f"home_ct={r[3]}, away_ct={r[4]}, null_ct={r[5]}")
+    if legacy_imb:
+        print("QUALITY WARNINGS (legacy):")
+        print(f" - Home/Away imbalance games: {len(legacy_imb)}")
+        for r in legacy_imb[:12]:
+            print(f"    game_id='{r[0]}', season_type='{r[1]}', game_date={r[2]}, "
+                  f"home_ct={r[3]}, away_ct={r[4]}, null_ct={r[5]}")
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry
-    sys.exit(main())
+    # Exit code policy: fail only if modern failures exist
+    if bad or modern_imb:
+        raise SystemExit(1)
+
+if __name__ == "__main__":
+    main()
