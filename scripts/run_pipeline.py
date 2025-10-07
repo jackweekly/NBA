@@ -73,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("Applying warehouse schema views")
     _run(["python", "scripts/apply_schema.py"])
 
+    logging.info("Running warehouse quality checks (pre-daily)")
+    _run(["python", "scripts/check_quality.py"])
+
     if not args.skip_daily:
         logging.info("Running daily incremental update")
         daily_cmd = ["python", "run_daily_update.py"]
@@ -80,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
             logging.debug("Propagating --verbose flag to run_daily_update.py")
             daily_cmd.append("--verbose")
         _run(daily_cmd)
+
+        logging.info("Running warehouse quality checks (post-daily)")
+        _run(["python", "scripts/check_quality.py"])
     else:
         logging.info("Skipping daily update per --skip-daily")
 

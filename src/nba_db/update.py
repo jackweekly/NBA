@@ -73,9 +73,11 @@ def _canonicalise(frame: pd.DataFrame) -> pd.DataFrame:
             continue
         canonical[column] = canonical[column].astype(str).str.strip()
         if column == "team_id":
-            canonical[column] = canonical[column].replace({"": "0"})
+            canonical[column] = canonical[column].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     if "game_id" in canonical.columns:
         canonical = canonicalize_game_ids(canonical, column="game_id")
+    if "team_id" in canonical.columns:
+        canonical = canonical[canonical["team_id"].notna()]
     return canonical
 
 
@@ -157,6 +159,28 @@ def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
+def _assert_no_duplicate_keys() -> None:
+    if not DUCKDB_PATH.exists():
+        return
+    con = duckdb.connect(str(DUCKDB_PATH))
+    try:
+        (duplicate_count,) = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT game_id, team_id, season_type, COUNT(*) AS c
+                FROM bronze_game_log_team
+                GROUP BY 1, 2, 3
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()
+    finally:
+        con.close()
+    if duplicate_count:
+        raise RuntimeError(f"Duplicate keys detected in bronze_game_log_team ({duplicate_count} rows)")
+
+
 def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
     if frame.empty:
         return
@@ -211,6 +235,7 @@ def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
         except duckdb.Error:  # pragma: no cover - safe cleanup
             pass
         con.close()
+    _assert_no_duplicate_keys()
 
 
 def _replace_duckdb_table(table: str, frame: pd.DataFrame, *, delete_key: str = "game_id") -> None:
