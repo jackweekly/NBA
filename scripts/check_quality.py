@@ -8,7 +8,10 @@ def main():
 
     # minutes comparison
     q = """
-      WITH joined AS (
+      WITH games AS (
+        SELECT DISTINCT game_id FROM bronze_game_norm
+      ),
+      joined AS (
         SELECT
           tm.game_id,
           tm.team_id,
@@ -17,12 +20,12 @@ def main():
           tm.minutes_raw,
           ge.target_minutes_per_team AS minutes_target
         FROM silver.team_minutes tm
+        JOIN games g USING (game_id)
         JOIN silver.game_enriched ge USING (game_id)
       )
       SELECT
         game_id, team_id, season_type, game_date,
         minutes_raw, minutes_target,
-        /* bad if target known and abs diff > small epsilon (e.g., > 1 min) */
         CASE WHEN minutes_target IS NOT NULL AND ABS(minutes_raw - minutes_target) > 1.0
              THEN TRUE ELSE FALSE END AS min_bad
       FROM joined
@@ -49,20 +52,22 @@ def main():
 
     # WL/home/away imbalance: treat as warnings if legacy
     q2 = """
-      WITH flags AS (
+      WITH games AS (SELECT DISTINCT game_id FROM bronze_game_norm),
+      flags AS (
         SELECT
-          ge.game_id,
+          g.game_id,
           ge.game_date,
           ge.season_type,
           CASE WHEN har.team_id_home IS NULL THEN 0 ELSE 1 END AS has_home,
           CASE WHEN har.team_id_away IS NULL THEN 0 ELSE 1 END AS has_away
-        FROM silver.game_enriched ge
+        FROM games g
         LEFT JOIN silver.home_away_resolved har USING (game_id)
+        JOIN silver.game_enriched ge USING (game_id)
       )
       SELECT game_id, season_type, game_date,
              SUM(has_home) AS home_ct,
              SUM(has_away) AS away_ct,
-             SUM(1 - (has_home + has_away)) AS null_ct
+             (2 - SUM(has_home) - SUM(has_away)) AS null_ct  -- exactly two flags expected
       FROM flags
       GROUP BY 1,2,3
       HAVING (home_ct != 1 OR away_ct != 1)

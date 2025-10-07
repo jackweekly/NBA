@@ -6,9 +6,7 @@ CREATE OR REPLACE VIEW silver.game_enriched AS
 WITH base AS (
   SELECT
     g.game_id,
-    /* normalize date */
     CAST(g.game_date AS DATE) AS game_date,
-    /* normalize season type */
     COALESCE(g.season_type,
              CASE
                WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 1 THEN 'Pre Season'
@@ -16,23 +14,39 @@ WITH base AS (
                WHEN CAST(SUBSTR(CAST(g.game_id AS VARCHAR), 1, 3) AS INT) = 4 THEN 'Playoffs'
                ELSE NULL
              END) AS season_type,
-    /* regulation periods (NBA) */
     4 AS regulation_periods,
-    /* OT periods, if known; otherwise infer 0 */
-    0 AS ot_periods
+    CAST(NULL AS INTEGER) AS ot_periods_raw
   FROM bronze_game_norm AS g
+),
+tm AS (
+  -- per-team minutes from silver.team_minutes
+  SELECT game_id, AVG(minutes_raw) AS avg_minutes_per_team
+  FROM silver.team_minutes
+  GROUP BY 1
+),
+ot_infer AS (
+  -- infer OT periods if we lack them: each OT adds +25 team minutes
+  SELECT
+    b.game_id,
+    CASE
+      WHEN tm.avg_minutes_per_team IS NULL THEN NULL
+      WHEN tm.avg_minutes_per_team <= 240 + 1 THEN 0
+      ELSE ROUND( (tm.avg_minutes_per_team - 240) / 25.0 )
+    END AS ot_periods_inferred
+  FROM base b
+  LEFT JOIN tm USING (game_id)
 )
 SELECT
-  game_id,
-  game_date,
-  season_type,
-  regulation_periods,
-  ot_periods,
-  /* per-team regulation minutes (48) + per-OT minutes (5) */
-  (regulation_periods * 12 * 5) AS regulation_minutes_per_team,
-  (ot_periods * 5 * 5)          AS ot_minutes_per_team,
-  ((regulation_periods * 12 * 5) + (ot_periods * 5 * 5)) AS target_minutes_per_team
-FROM base;
+  b.game_id,
+  b.game_date,
+  b.season_type,
+  b.regulation_periods,
+  COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) AS ot_periods,
+  (b.regulation_periods * 12 * 5) AS regulation_minutes_per_team,
+  (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 5 * 5) AS ot_minutes_per_team,
+  ((b.regulation_periods * 12 * 5) + (COALESCE(b.ot_periods_raw, o.ot_periods_inferred, 0) * 5 * 5)) AS target_minutes_per_team
+FROM base b
+LEFT JOIN ot_infer o USING (game_id);
 
 -- Team minutes from bronze_game
 CREATE OR REPLACE VIEW silver.team_minutes AS
