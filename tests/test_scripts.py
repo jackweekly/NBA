@@ -33,7 +33,7 @@ def test_build_parser_supports_overrides():
 def test_run_daily_update_calls_update(monkeypatch):
     calls: list[dict[str, object]] = []
 
-    def fake_daily(*, start_date=None, end_date=None):
+    def fake_daily(*, start_date=None, end_date=None, **kwargs):
         calls.append({"start_date": start_date, "end_date": end_date})
         return nba_update.DailyUpdateResult(Path("game.csv"), 0, True, 5)
 
@@ -46,7 +46,7 @@ def test_run_daily_update_calls_update(monkeypatch):
 
 
 def test_run_daily_update_sets_numeric_environment(monkeypatch):
-    def fake_daily(*, start_date=None, end_date=None):  # noqa: ARG001
+    def fake_daily(*, start_date=None, end_date=None, **kwargs):  # noqa: ARG001
         return nba_update.DailyUpdateResult(Path("game.csv"), 0, True, 0)
 
     monkeypatch.setattr(nba_update, "daily", fake_daily)

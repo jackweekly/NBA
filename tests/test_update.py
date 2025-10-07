@@ -17,6 +17,10 @@ def _override_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "GAME_CSV", game_csv, raising=False)
     monkeypatch.setattr(update, "RAW_DIR", raw_dir, raising=False)
     monkeypatch.setattr(update, "GAME_CSV", game_csv, raising=False)
+    monkeypatch.setattr(update.extract, "get_box_score", lambda *args, **kwargs: (pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(update.extract, "get_play_by_play", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(update.extract, "PER_GAME_SLEEP_SECONDS", 0, raising=False)
+    monkeypatch.setattr(update, "MAX_DETAIL_WORKERS", 1, raising=False)
 
 
 def test_daily_appends_new_rows(monkeypatch, tmp_path):

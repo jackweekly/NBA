@@ -5,11 +5,11 @@ import logging
 import random
 import time
 from datetime import date
-from typing import Optional
+from typing import Optional, Iterable
 
 import pandas as pd
 import requests
-from requests import exceptions as requests_exceptions
+from requests import HTTPError, exceptions as requests_exceptions
 
 from .utils import get_proxies
 
@@ -18,10 +18,23 @@ LOGGER = logging.getLogger(__name__)
 
 SEASON_TYPES = [
     "Regular Season",
-    "Playoffs",
     "Pre Season",
-    "In Season Tournament",
+    "PlayIn",
+    "Playoffs",
+    "In-Season Tournament",
 ]
+
+SEASON_TYPE_CANON = {
+    "regular season": "Regular Season",
+    "pre season": "Pre Season",
+    "preseason": "Pre Season",
+    "playin": "PlayIn",
+    "play-in": "PlayIn",
+    "playoffs": "Playoffs",
+    "post season": "Playoffs",
+    "in season tournament": "In-Season Tournament",
+    "in-season tournament": "In-Season Tournament",
+}
 
 NBA_API_URL = "https://stats.nba.com/stats/leaguegamelog"
 NBA_API_HEADERS = {
@@ -64,6 +77,31 @@ def _format_for_api(value: Optional[date]) -> Optional[str]:
     return value.strftime("%m/%d/%Y") if value else None
 
 
+def _mmddyyyy(value: pd.Timestamp) -> str:
+    return value.strftime("%m/%d/%Y")
+
+
+
+def season_types_for_window(start: pd.Timestamp, end: pd.Timestamp) -> list[str]:
+    """Return plausible season types for a batched window."""
+
+    types: set[str] = set()
+    if start.month <= 10 <= end.month or start.month == 9 or end.month == 9:
+        types.add("Pre Season")
+    types.add("Regular Season")
+    if end.month >= 11:
+        types.add("In-Season Tournament")
+    if end.month >= 4:
+        types.update({"PlayIn", "Playoffs"})
+    return sorted(types)
+
+
+def _canon_season_type(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return SEASON_TYPE_CANON.get(value.strip().lower(), value)
+
+
 def _call_with_retry(description: str, func):
     delay = 4
     attempts = 0
@@ -99,9 +137,9 @@ def _normalise_frame(frame: pd.DataFrame, season_type: str) -> pd.DataFrame:
 def _fetch_leaguegamelog(
     *,
     season: str,
-    season_type: str,
-    formatted_from: Optional[str],
-    formatted_to: Optional[str],
+    season_type: Optional[str],
+    formatted_from: str,
+    formatted_to: str,
     timeout: int,
     proxy: Optional[str],
 ) -> pd.DataFrame:
@@ -111,10 +149,10 @@ def _fetch_leaguegamelog(
         "LeagueID": "00",
         "PlayerOrTeam": "T",
         "Season": season,
-        "SeasonType": season_type,
+        "SeasonType": _canon_season_type(season_type) if season_type else "",
         "Sorter": "DATE",
-        "DateFrom": formatted_from or "",
-        "DateTo": formatted_to or "",
+        "DateFrom": formatted_from,
+        "DateTo": formatted_to,
     }
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
@@ -125,7 +163,13 @@ def _fetch_leaguegamelog(
         timeout=timeout,
         proxies=proxies,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except HTTPError as exc:  # pragma: no cover - non-retriable errors handled upstream
+        status = getattr(exc.response, "status_code", None)
+        if status == 400:
+            return pd.DataFrame()
+        raise
     payload = response.json()
 
     datasets = payload.get("resultSets") or payload.get("resultSet")
@@ -138,7 +182,9 @@ def _fetch_leaguegamelog(
 
     headers = target.get("headers", [])
     rows = target.get("rowSet", [])
-    return pd.DataFrame(rows, columns=headers)
+    frame = pd.DataFrame(rows, columns=headers)
+    frame.columns = frame.columns.str.lower()
+    return frame
 
 
 def get_league_game_log_from_date(
@@ -149,72 +195,61 @@ def get_league_game_log_from_date(
 ) -> pd.DataFrame:
     """Fetch league game logs between ``start`` and ``end`` (inclusive)."""
 
-    today = date.today()
-    latest_season_year = _latest_started_season_year(today)
-    effective_end = end or today
-    effective_end_year = min(_season_year_for_date(effective_end), latest_season_year)
-    start_year = _season_year_for_date(start)
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end if end else date.today())
 
-    if start_year > latest_season_year:
-        LOGGER.info("Start date %s is in a future season; returning empty frame", start)
+    if start_ts > end_ts:
         return pd.DataFrame()
 
-    frames: list[pd.DataFrame] = []
     proxies = get_proxies()
+    frames: list[pd.DataFrame] = []
 
-    for season_year in range(start_year, effective_end_year + 1):
-        season = _season_label(season_year)
-        season_start = date(season_year, 7, 1)
-        season_end = date(season_year + 1, 6, 30)
-        season_from = start if season_year == start_year else season_start
-        season_to = effective_end if season_year == effective_end_year else season_end
+    current = start_ts.normalize()
+    final = end_ts.normalize()
 
-        for season_type in SEASON_TYPES:
-            formatted_from = _format_for_api(season_from if season_from >= season_start else season_start)
-            formatted_to = _format_for_api(season_to if season_to <= season_end else season_end)
+    while current <= final:
+        month_end = (current + pd.offsets.MonthEnd(0)).normalize()
+        window_end = min(month_end, final)
+        season_label = _season_label(_season_year_for_date(current.date()))
 
+        for season_type in season_types_for_window(current, window_end):
             proxy = random.choice(proxies) if proxies else None
 
             def _fetch() -> pd.DataFrame:
-                try:
-                    return _fetch_leaguegamelog(
-                        season=season,
-                        season_type=season_type,
-                        formatted_from=formatted_from,
-                        formatted_to=formatted_to,
-                        timeout=timeout,
-                        proxy=proxy,
-                    )
-                except requests_exceptions.HTTPError as exc:
-                    status_code = getattr(exc.response, "status_code", None)
-                    if status_code in {400, 404}:
-                        LOGGER.info(
-                            "No data for season=%s type=%s (HTTP %s); skipping",
-                            season,
-                            season_type,
-                            status_code,
-                        )
-                        return pd.DataFrame()
-                    raise
+                return _fetch_leaguegamelog(
+                    season=season_label,
+                    season_type=season_type,
+                    formatted_from=_mmddyyyy(current),
+                    formatted_to=_mmddyyyy(window_end),
+                    timeout=timeout,
+                    proxy=proxy,
+                )
 
-            frame = _call_with_retry(f"leaguegamelog {season} {season_type}", _fetch)
-            if not frame.empty:
-                normalised = _normalise_frame(frame, season_type)
-                frames.append(normalised)
+            frame = _call_with_retry(
+                f"leaguegamelog {current.date()}→{window_end.date()} {season_type}",
+                _fetch,
+            )
+            if frame.empty:
+                continue
+            if "game_date" in frame.columns:
+                frame["game_date"] = pd.to_datetime(frame["game_date"], errors="coerce")
+            if "season_type" not in frame.columns:
+                frame["season_type"] = season_type
+            frames.append(frame)
             time.sleep(REQUEST_SLEEP_SECONDS)
+
+        current = (window_end + pd.Timedelta(days=1)).normalize()
 
     if not frames:
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True)
     if "game_date" in combined.columns:
-        upper_bound = end or effective_end
-        mask = combined["game_date"].isna() | (
-            (combined["game_date"].dt.date >= start) &
-            (combined["game_date"].dt.date <= upper_bound)
-        )
-        combined = combined[mask]
-        combined.reset_index(drop=True, inplace=True)
+        combined = combined[(combined["game_date"].dt.date >= start_ts.date()) & (combined["game_date"].dt.date <= end_ts.date())]
+    subset = [col for col in ["game_id", "team_id", "season_type"] if col in combined.columns]
+    if subset:
+        combined.drop_duplicates(subset=subset, inplace=True)
+    combined.reset_index(drop=True, inplace=True)
     return combined
 
 

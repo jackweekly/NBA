@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -21,6 +22,9 @@ LOGGER = logging.getLogger(__name__)
 GAME_LOG_PRIMARY_KEY = ("game_id", "team_id", "season_type")
 DEFAULT_SEASON_TYPE = "Regular Season"
 HISTORICAL_START_DATE = date(1946, 11, 1)
+
+
+MAX_DETAIL_WORKERS = int(os.environ.get("NBA_DB_DETAIL_WORKERS", "6"))
 
 
 @dataclass(slots=True)
@@ -87,6 +91,17 @@ def _duckdb_table_exists(table: str) -> bool:
         con.close()
 
 
+def _existing_ids(table: str) -> set[str]:
+    if not _duckdb_table_exists(table):
+        return set()
+    con = duckdb.connect(str(DUCKDB_PATH))
+    try:
+        rows = con.execute(f"SELECT DISTINCT game_id FROM {table}").fetchall()
+        return {str(row[0]) for row in rows if row and row[0] is not None}
+    finally:
+        con.close()
+
+
 def _read_duckdb_game_log() -> pd.DataFrame:
     if not _duckdb_table_exists("bronze_game_log_team"):
         raise FileNotFoundError("bronze_game_log_team not found in DuckDB warehouse")
@@ -148,6 +163,27 @@ def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
     DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DUCKDB_PATH))
     con.execute("PRAGMA threads=4;")
+    frame = frame.copy()
+    column_meta = con.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='main' AND table_name='bronze_game_log_team' ORDER BY ordinal_position").fetchall()
+    target_cols = [col for col, _ in column_meta]
+    if target_cols:
+        for col in target_cols:
+            if col not in frame.columns:
+                frame[col] = pd.NA
+        type_map = {col: dtype.upper() for col, dtype in column_meta}
+        for col in target_cols:
+            if col not in frame.columns:
+                continue
+            dtype = type_map.get(col, "")
+            if dtype in {"BIGINT", "INTEGER", "INT", "SMALLINT"}:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").astype("Int64")
+            elif dtype in {"DOUBLE", "FLOAT", "REAL", "DECIMAL"}:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            elif dtype == "BOOLEAN":
+                frame[col] = frame[col].astype("boolean")
+            elif dtype == "DATE":
+                frame[col] = pd.to_datetime(frame[col], errors="coerce")
+        frame = frame[target_cols]
     try:
         con.register("src", frame)
         con.execute("CREATE TABLE IF NOT EXISTS bronze_game_log_team AS SELECT * FROM src WHERE 0=1")
@@ -183,6 +219,30 @@ def _replace_duckdb_table(table: str, frame: pd.DataFrame, *, delete_key: str = 
     DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DUCKDB_PATH))
     con.execute("PRAGMA threads=4;")
+    frame = frame.copy()
+    column_meta = con.execute(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='main' AND table_name=? ORDER BY ordinal_position",
+        [table],
+    ).fetchall()
+    target_cols = [col for col, _ in column_meta]
+    if target_cols:
+        for col in target_cols:
+            if col not in frame.columns:
+                frame[col] = pd.NA
+        type_map = {col: dtype.upper() for col, dtype in column_meta}
+        for col in target_cols:
+            if col not in frame.columns:
+                continue
+            dtype = type_map.get(col, "")
+            if dtype in {"BIGINT", "INTEGER", "INT", "SMALLINT"}:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").astype("Int64")
+            elif dtype in {"DOUBLE", "FLOAT", "REAL", "DECIMAL"}:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            elif dtype == "BOOLEAN":
+                frame[col] = frame[col].astype("boolean")
+            elif dtype == "DATE":
+                frame[col] = pd.to_datetime(frame[col], errors="coerce")
+        frame = frame[target_cols]
     try:
         con.register("src", frame)
         con.execute(f"CREATE TABLE IF NOT EXISTS {table} AS SELECT * FROM src WHERE 0=1")
@@ -208,45 +268,74 @@ def _normalise_id_columns(frame: pd.DataFrame, columns: Sequence[str]) -> pd.Dat
 
 
 def _fetch_boxscores(game_ids: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not game_ids:
+        return pd.DataFrame(), pd.DataFrame()
+
     team_frames: list[pd.DataFrame] = []
     player_frames: list[pd.DataFrame] = []
-    for index, game_id in enumerate(game_ids, 1):
+    workers = max(1, min(MAX_DETAIL_WORKERS, len(game_ids)))
+
+    def _worker(game_id: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         try:
             team_frame, player_frame = extract.get_box_score(game_id)
         except RuntimeError as exc:  # noqa: BLE001 - network errors already logged
             LOGGER.warning("Box score fetch failed for %s: %s", game_id, exc)
-            continue
+            return pd.DataFrame(), pd.DataFrame()
+        finally:
+            time.sleep(extract.PER_GAME_SLEEP_SECONDS)
         if not team_frame.empty:
             team_frame = _normalise_id_columns(team_frame, ["game_id", "team_id"])
-            team_frames.append(team_frame)
         if not player_frame.empty:
             player_frame = _normalise_id_columns(player_frame, ["game_id", "team_id", "player_id"])
-            player_frames.append(player_frame)
-        if index % 100 == 0:
-            LOGGER.info("Fetched box scores for %s/%s games", index, len(game_ids))
-        time.sleep(extract.PER_GAME_SLEEP_SECONDS)
+        return team_frame, player_frame
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker, game_id): game_id for game_id in game_ids}
+        for index, future in enumerate(as_completed(futures), 1):
+            team_frame, player_frame = future.result()
+            if not team_frame.empty:
+                team_frames.append(team_frame)
+            if not player_frame.empty:
+                player_frames.append(player_frame)
+            if index % 100 == 0:
+                LOGGER.info("Fetched box scores for %s/%s games", index, len(game_ids))
+
     team_df = pd.concat(team_frames, ignore_index=True) if team_frames else pd.DataFrame()
     player_df = pd.concat(player_frames, ignore_index=True) if player_frames else pd.DataFrame()
     return team_df, player_df
 
 
 def _fetch_play_by_play_games(game_ids: Sequence[str]) -> pd.DataFrame:
+    if not game_ids:
+        return pd.DataFrame()
+
     frames: list[pd.DataFrame] = []
-    for index, game_id in enumerate(game_ids, 1):
+    workers = max(1, min(MAX_DETAIL_WORKERS, len(game_ids)))
+
+    def _worker(game_id: str) -> pd.DataFrame:
         try:
             frame = extract.get_play_by_play(game_id)
         except RuntimeError as exc:  # noqa: BLE001
             LOGGER.warning("Play-by-play fetch failed for %s: %s", game_id, exc)
-            continue
+            return pd.DataFrame()
+        finally:
+            time.sleep(extract.PER_GAME_SLEEP_SECONDS)
         if frame.empty:
-            continue
+            return frame
         frame = _normalise_id_columns(frame, ["game_id", "team_id"])
         if "eventnum" in frame.columns:
             frame["eventnum"] = pd.to_numeric(frame["eventnum"], errors="coerce")
-        frames.append(frame)
-        if index % 100 == 0:
-            LOGGER.info("Fetched play-by-play for %s/%s games", index, len(game_ids))
-        time.sleep(extract.PER_GAME_SLEEP_SECONDS)
+        return frame
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker, game_id): game_id for game_id in game_ids}
+        for index, future in enumerate(as_completed(futures), 1):
+            frame = future.result()
+            if not frame.empty:
+                frames.append(frame)
+            if index % 100 == 0:
+                LOGGER.info("Fetched play-by-play for %s/%s games", index, len(game_ids))
+
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -254,18 +343,38 @@ def _update_additional_tables(game_ids: Sequence[str]) -> None:
     if not game_ids:
         return
 
-    LOGGER.info("Fetching detailed stats for %s games", len(game_ids))
-    team_box, player_box = _fetch_boxscores(game_ids)
-    if not team_box.empty:
-        _replace_duckdb_table("bronze_box_score_team", team_box)
-        LOGGER.info("Upserted team box scores (%s rows)", len(team_box))
-    if not player_box.empty:
-        _replace_duckdb_table("bronze_box_score_player", player_box)
-        LOGGER.info("Upserted player box scores (%s rows)", len(player_box))
-    pbp = _fetch_play_by_play_games(game_ids)
-    if not pbp.empty:
-        _replace_duckdb_table("bronze_play_by_play", pbp)
-        LOGGER.info("Upserted play-by-play events (%s rows)", len(pbp))
+    team_existing = _existing_ids("bronze_box_score_team")
+    player_existing = _existing_ids("bronze_box_score_player")
+    pbp_existing = _existing_ids("bronze_play_by_play")
+
+    boxscore_ids = [gid for gid in game_ids if gid not in team_existing or gid not in player_existing]
+    pbp_ids = [gid for gid in game_ids if gid not in pbp_existing]
+
+    LOGGER.info(
+        "Fetching detailed stats for %s new games (boxscores=%s, pbp=%s)",
+        len(game_ids),
+        len(boxscore_ids),
+        len(pbp_ids),
+    )
+
+    if boxscore_ids:
+        team_box, player_box = _fetch_boxscores(boxscore_ids)
+        if not team_box.empty:
+            _replace_duckdb_table("bronze_box_score_team", team_box)
+            LOGGER.info("Upserted team box scores (%s rows)", len(team_box))
+        if not player_box.empty:
+            _replace_duckdb_table("bronze_box_score_player", player_box)
+            LOGGER.info("Upserted player box scores (%s rows)", len(player_box))
+    else:
+        LOGGER.info("No new box score games detected")
+
+    if pbp_ids:
+        pbp = _fetch_play_by_play_games(pbp_ids)
+        if not pbp.empty:
+            _replace_duckdb_table("bronze_play_by_play", pbp)
+            LOGGER.info("Upserted play-by-play events (%s rows)", len(pbp))
+    else:
+        LOGGER.info("No new play-by-play games detected")
 
 
 def _log_fetch_window(new_rows: pd.DataFrame) -> None:
