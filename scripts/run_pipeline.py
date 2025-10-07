@@ -51,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the daily incremental update (useful for bootstrapping only)",
     )
     parser.add_argument(
+        "--offline-only",
+        action="store_true",
+        help="Run home/away override resolution without network calls",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable DEBUG logging for extra insight",
@@ -74,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     fetch_cmd = ["python", "scripts/fetch_home_away_overrides.py"]
     if args.verbose:
         fetch_cmd.append("--verbose")
+    if args.offline_only:
+        fetch_cmd.append("--offline-only")
     _run(fetch_cmd)
 
     logging.info("Applying warehouse schema views")
@@ -94,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         fetch_cmd_post = ["python", "scripts/fetch_home_away_overrides.py"]
         if args.verbose:
             fetch_cmd_post.append("--verbose")
+        if args.offline_only:
+            fetch_cmd_post.append("--offline-only")
         _run(fetch_cmd_post)
 
         logging.info("Running warehouse quality checks (post-daily)")
