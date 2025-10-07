@@ -35,6 +35,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Download the full historical league game log ignoring existing files",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG-level logging for additional progress detail",
+    )
     return parser
 
 
@@ -66,7 +71,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
 
     logging.info("Starting daily update at %s", datetime.now().isoformat(timespec="seconds"))
 

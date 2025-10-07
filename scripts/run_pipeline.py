@@ -75,7 +75,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_daily:
         logging.info("Running daily incremental update")
-        _run(["python", "run_daily_update.py"])
+        daily_cmd = ["python", "run_daily_update.py"]
+        if args.verbose:
+            logging.debug("Propagating --verbose flag to run_daily_update.py")
+            daily_cmd.append("--verbose")
+        _run(daily_cmd)
     else:
         logging.info("Skipping daily update per --skip-daily")
 
