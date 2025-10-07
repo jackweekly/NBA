@@ -33,8 +33,8 @@ CHECKS: Tuple[QualityCheck, ...] = (
             game_id,
             season_type,
             MAX(game_date) AS game_date,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(wl, '')) = 'W') AS wins,
-            COUNT(*) FILTER (WHERE UPPER(COALESCE(wl, '')) = 'L') AS losses
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl AS VARCHAR), '')) = 'W') AS wins,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(CAST(wl AS VARCHAR), '')) = 'L') AS losses
           FROM silver.team_game_cov
           WHERE {filter}
           GROUP BY game_id, season_type

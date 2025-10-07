@@ -6,5 +6,5 @@ WITH seasons AS (
 )
 SELECT
   season_id,
-  TRY_CAST(SUBSTRING(season_id, 1, 4) AS INTEGER) AS start_year
+  TRY_CAST(SUBSTR(CAST(season_id AS VARCHAR), 1, 4) AS INT) AS start_year
 FROM seasons;
