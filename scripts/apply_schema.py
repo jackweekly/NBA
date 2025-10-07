@@ -69,7 +69,7 @@ def _collect_sql_files(root: pathlib.Path) -> list[pathlib.Path]:
         raise FileNotFoundError(build)
     ordered.append(build)
 
-    for subdir_name in ("helpers", "silver", "marts"):
+    for subdir_name in ("helpers", "bronze", "silver", "marts"):
         subdir = root / subdir_name
         if not subdir.exists():
             continue

@@ -210,7 +210,6 @@ def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
                 frame[col] = pd.to_datetime(frame[col], errors="coerce")
         frame = frame[target_cols]
     try:
-        con.register("src", frame)
         con.execute("CREATE TABLE IF NOT EXISTS bronze_game_log_team AS SELECT * FROM src WHERE 0=1")
         if replace:
             LOGGER.info("Replacing bronze_game_log_team with %s rows", len(frame))
