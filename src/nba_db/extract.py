@@ -55,8 +55,8 @@ NBA_API_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
-REQUEST_SLEEP_SECONDS = 1.0
-DEFAULT_TIMEOUT = 10
+REQUEST_SLEEP_SECONDS = 1.0 # WARNING: Reducing this value may lead to API rate limiting or temporary bans.
+DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 10
 

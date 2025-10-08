@@ -36,3 +36,27 @@ build/
 dist/
 *.egg-info/
 csv/
+
+# ------------------------------
+# Data Artifacts (local only)
+# ------------------------------
+# DuckDB, SQLite, CSV, Parquet, Feather, etc.
+*.arrow
+*.jsonl
+
+# ------------------------------
+# Cache and Temp
+# ------------------------------
+*.tmp
+*.bak
+
+# ------------------------------
+# Environment / Config
+# ------------------------------
+.env.*
+*.swp
+
+# ------------------------------
+# Compiled / Installed files
+# ------------------------------
+*.pyc

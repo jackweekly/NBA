@@ -114,7 +114,7 @@ def seed_duckdb(
     database.parent.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(str(database))
-    con.execute("PRAGMA threads=4;")
+    con.execute("PRAGMA threads=16;")
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
     con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold;")

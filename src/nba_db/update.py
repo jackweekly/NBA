@@ -24,7 +24,7 @@ DEFAULT_SEASON_TYPE = "Regular Season"
 HISTORICAL_START_DATE = date(1946, 11, 1)
 
 
-MAX_DETAIL_WORKERS = min(int(os.environ.get("NBA_DB_DETAIL_WORKERS", "6")), 8)
+MAX_DETAIL_WORKERS = min(int(os.environ.get("NBA_DB_DETAIL_WORKERS", "16")), 16)
 
 
 @dataclass(slots=True)
@@ -159,12 +159,18 @@ def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _assert_no_duplicate_keys() -> None:
-    if not DUCKDB_PATH.exists():
-        return
-    con = duckdb.connect(str(DUCKDB_PATH))
+def _assert_no_duplicate_keys(con: Optional[duckdb.DuckDBPyConnection] = None) -> None:
+    if con is None:
+        if not DUCKDB_PATH.exists():
+            return
+        _con = duckdb.connect(str(DUCKDB_PATH))
+        close_con = True
+    else:
+        _con = con
+        close_con = False
+
     try:
-        (duplicate_count,) = con.execute(
+        (duplicate_count,) = _con.execute(
             """
             SELECT COUNT(*)
             FROM (
@@ -176,20 +182,29 @@ def _assert_no_duplicate_keys() -> None:
             """
         ).fetchone()
     finally:
-        con.close()
+        if close_con:
+            _con.close()
     if duplicate_count:
         raise RuntimeError(f"Duplicate keys detected in bronze_game_log_team ({duplicate_count} rows)")
 
 
-def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
+def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False, con: Optional[duckdb.DuckDBPyConnection] = None) -> None:
     if frame.empty:
         return
 
     DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(DUCKDB_PATH))
-    con.execute("PRAGMA threads=4;")
+    
+    # Use provided connection or create a new one
+    if con is None:
+        _con = duckdb.connect(str(DUCKDB_PATH))
+        _con.execute("PRAGMA threads=16;")
+        close_con = True
+    else:
+        _con = con
+        close_con = False
+
     frame = frame.copy()
-    column_meta = con.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='main' AND table_name='bronze_game_log_team' ORDER BY ordinal_position").fetchall()
+    column_meta = _con.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='main' AND table_name='bronze_game_log_team' ORDER BY ordinal_position").fetchall()
     target_cols = [col for col, _ in column_meta]
     if target_cols:
         for col in target_cols:
@@ -210,14 +225,16 @@ def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
                 frame[col] = pd.to_datetime(frame[col], errors="coerce")
         frame = frame[target_cols]
     try:
-        con.execute("CREATE TABLE IF NOT EXISTS bronze_game_log_team AS SELECT * FROM src WHERE 0=1")
+        _con.register("src", frame)
+        _con.execute("DROP TABLE IF EXISTS bronze_game_log_team;")
+        _con.execute("CREATE TABLE IF NOT EXISTS bronze_game_log_team AS SELECT * FROM src WHERE 0=1")
         if replace:
             LOGGER.info("Replacing bronze_game_log_team with %s rows", len(frame))
-            con.execute("DELETE FROM bronze_game_log_team")
-            con.execute("INSERT INTO bronze_game_log_team SELECT * FROM src")
+            _con.execute("DELETE FROM bronze_game_log_team")
+            _con.execute("INSERT INTO bronze_game_log_team SELECT * FROM src")
         else:
             LOGGER.info("Merging %s rows into bronze_game_log_team", len(frame))
-            con.execute(
+            _con.execute(
                 """
                 MERGE INTO bronze_game_log_team AS tgt
                 USING src AS src
@@ -228,13 +245,14 @@ def _upsert_duckdb(frame: pd.DataFrame, *, replace: bool = False) -> None:
                 WHEN NOT MATCHED THEN INSERT *
                 """
             )
+        _assert_no_duplicate_keys(_con)
     finally:
         try:
-            con.unregister("src")
+            _con.unregister("src")
         except duckdb.Error:  # pragma: no cover - safe cleanup
             pass
-        con.close()
-    _assert_no_duplicate_keys()
+        if close_con:
+            _con.close()
 
 
 def _replace_duckdb_table(table: str, frame: pd.DataFrame, *, delete_key: str = "game_id") -> None:

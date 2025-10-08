@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import duckdb
+
 from nba_db.paths import DUCKDB_PATH, WYATT_DATASET_DIR
 
 KAGGLE_SQLITE = WYATT_DATASET_DIR / "nba.sqlite"
@@ -36,6 +38,19 @@ def _ensure_kaggle_dataset(force: bool) -> None:
         _run(cmd)
     else:
         logging.info("Kaggle dataset already present at %s", KAGGLE_SQLITE)
+
+
+def _duckdb_is_seeded() -> bool:
+    if not DUCKDB_PATH.exists():
+        return False
+    con = duckdb.connect(str(DUCKDB_PATH))
+    try:
+        tables = con.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name IS NULL AND schema_name = 'main'"
+        ).fetchall()
+        return any(name == "bronze_game" for (name,) in tables)
+    finally:
+        con.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,8 +87,11 @@ def main(argv: list[str] | None = None) -> int:
 
     _ensure_kaggle_dataset(force=args.force_kaggle)
 
-    logging.info("Seeding DuckDB at %s", DUCKDB_PATH)
-    _run(["python", "scripts/seed_duckdb.py"])
+    if args.force_kaggle or not _duckdb_is_seeded():
+        logging.info("Seeding DuckDB at %s", DUCKDB_PATH)
+        _run(["python", "scripts/seed_duckdb.py"])
+    else:
+        logging.info("DuckDB already seeded at %s; skipping seeding step", DUCKDB_PATH)
 
     logging.info("Resolving home/away overrides")
     fetch_cmd = ["python", "scripts/fetch_home_away_overrides.py"]
