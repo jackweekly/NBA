@@ -25,51 +25,67 @@ pip install -e .
 
 The package depends on `requests`, `pandas`, `nba_api`, and `python-dateutil`.
 
+### Kaggle CLI Setup
+
+To enable the automatic download of the Kaggle bootstrap dataset, you need to install the Kaggle CLI and configure your credentials:
+
+1.  Install the Kaggle package:
+    ```bash
+    pip install kaggle
+    ```
+2.  Set up your Kaggle API credentials:
+    *   Go to your Kaggle account page (`https://www.kaggle.com/<username>/account`).
+    *   Click on "Create New API Token" to download `kaggle.json`.
+    *   Move this file to `~/.kaggle/kaggle.json` (create the `.kaggle` directory if it doesn't exist).
+    *   Ensure the file has appropriate permissions (e.g., `chmod 600 ~/.kaggle/kaggle.json`).
+
+
 ## Usage
+
+The primary entry point for running the data pipeline is `scripts/run_pipeline.py`.
+This script handles both the one-shot bootstrap of historical data and daily
+incremental updates.
 
 The utilities look for `config.yaml` at the project root. The default file in
 this repository points `raw.raw_dir` to `data/raw`, matching the original repo.
 
-### One-time bootstrap
+### Running the Pipeline
 
-Run the initial ingestion to create the canonical CSVs (players, teams, game
-logs, and game summaries):
-
-```bash
-python run_init.py
-```
-
-This command mirrors the historical behaviour of `nba_api_ingestion.py` by
-querying the `nba_api` endpoints and writing the following files under the raw
-data directory defined in `config.yaml`:
-
-* `common_player_info.csv`
-* `team_info_common.csv`
-* `game.csv`
-* `game_summary.csv`
-
-### Daily updates
-
-Trigger a full historical download (season-by-season) with:
+To run the full pipeline, including initial data seeding and daily updates:
 
 ```bash
-python run_daily_update.py --fetch-all-history
+python scripts/run_pipeline.py
 ```
 
-For incremental backfills from a specific date:
+This command will:
+1. Ensure the Kaggle dataset is present (downloading it via `run_init.py` if needed).
+2. Seed the DuckDB database using `scripts/seed_duckdb.py`.
+3. Resolve home/away overrides via `scripts/fetch_home_away_overrides.py`.
+4. Apply warehouse schema views using `scripts/apply_schema.py`.
+5. Run quality checks with `scripts/check_quality.py`.
+6. Perform daily incremental updates via `run_daily_update.py`.
+7. Re-resolve home/away overrides and run quality checks again.
 
-```bash
-python run_daily_update.py 2010-10-01
-```
+### Options
 
-Running `python run_daily_update.py` without arguments appends games that were
-played after the last entry in `game.csv`. Both scripts initialise conservative
-defaults for OpenBLAS/MKL environment variables to avoid the "Floating point
-exception" crashes that can appear on certain virtualised CPUs.
+The `run_pipeline.py` script accepts the following arguments:
 
-The helper `scripts/update_data.py` exposes the same options behind an
-`argparse` interface so you can integrate the downloader in other automation
-tools.
+*   `--force-kaggle`: Force re-download of the Kaggle bootstrap dataset before seeding.
+    ```bash
+    python scripts/run_pipeline.py --force-kaggle
+    ```
+*   `--skip-daily`: Skip the daily incremental update (useful for bootstrapping only).
+    ```bash
+    python scripts/run_pipeline.py --skip-daily
+    ```
+*   `--offline-only`: Run home/away override resolution without network calls.
+    ```bash
+    python scripts/run_pipeline.py --offline-only
+    ```
+*   `--verbose`: Enable DEBUG logging for extra insight.
+    ```bash
+    python scripts/run_pipeline.py --verbose
+    ```
 
 ## Testing
 
