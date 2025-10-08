@@ -36,7 +36,12 @@ To enable the automatic download of the Kaggle bootstrap dataset, you need to in
 2.  Set up your Kaggle API credentials:
     *   Go to your Kaggle account page (`https://www.kaggle.com/<username>/account`).
     *   Click on "Create New API Token" to download `kaggle.json`.
-    *   Move this file to `~/.kaggle/kaggle.json` (create the `.kaggle` directory if it doesn't exist).
+    *   Alternatively, you can create the `~/.kaggle/kaggle.json` file manually with your credentials. Replace `YOUR_USERNAME` and `YOUR_KEY` with your actual Kaggle username and API key:
+        ```bash
+        mkdir -p ~/.kaggle/
+        echo '{"username":"YOUR_USERNAME","key":"YOUR_KEY"}' > ~/.kaggle/kaggle.json
+        chmod 600 ~/.kaggle/kaggle.json
+        ```
     *   Ensure the file has appropriate permissions (e.g., `chmod 600 ~/.kaggle/kaggle.json`).
 
 

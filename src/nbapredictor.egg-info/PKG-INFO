@@ -12,6 +12,7 @@ Requires-Dist: python-dateutil>=2.9
 Requires-Dist: pyyaml>=6.0
 Requires-Dist: duckdb>=1.0
 Requires-Dist: tenacity>=8.2
+Requires-Dist: kaggle
 
 # NBA Predictor Data Pipeline
 
@@ -39,6 +40,21 @@ pip install -e .
 ```
 
 The package depends on `requests`, `pandas`, `nba_api`, and `python-dateutil`.
+
+### Kaggle CLI Setup
+
+To enable the automatic download of the Kaggle bootstrap dataset, you need to install the Kaggle CLI and configure your credentials:
+
+1.  Install the Kaggle package:
+    ```bash
+    pip install kaggle
+    ```
+2.  Set up your Kaggle API credentials:
+    *   Go to your Kaggle account page (`https://www.kaggle.com/<username>/account`).
+    *   Click on "Create New API Token" to download `kaggle.json`.
+    *   Move this file to `~/.kaggle/kaggle.json` (create the `.kaggle` directory if it doesn't exist).
+    *   Ensure the file has appropriate permissions (e.g., `chmod 600 ~/.kaggle/kaggle.json`).
+
 
 ## Usage
 
